@@ -3,7 +3,7 @@ import json
 import pytest
 from PIL import Image
 
-from vlm_bench.runner import read_records, resume_benchmark, run_benchmark
+from vlm_bench.runner import PROMPT, read_records, resume_benchmark, run_benchmark
 
 
 @pytest.fixture
@@ -73,6 +73,13 @@ def run(dataset, tmp_path, **kwargs):
         client_factory=FakeClient,
         **kwargs,
     )
+
+
+def test_prompt_enforces_literal_word_level_ocr():
+    assert "Return only the transcription" in PROMPT
+    assert "Never describe the image" in PROMPT
+    assert "Never" in PROMPT and "translate" in PROMPT
+    assert "single word or punctuation mark" in PROMPT
 
 
 def test_full_run_all_records_warmups_separate(dataset, tmp_path):

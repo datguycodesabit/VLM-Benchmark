@@ -68,7 +68,7 @@ def test_crops_union_of_retained_handwriting_and_uses_same_lines_for_xml_referen
     assert Path(sample["image_path"]).is_absolute()
     assert Path(sample["crop_path"]).is_absolute()
     with Image.open(sample["crop_path"]) as crop:
-        assert crop.size == (70, 68)
+        assert crop.size == (70 * 3 + 32, 68 * 3 + 32)
     assert all(len(value) == 64 for value in sample["hashes"].values())
 
 
@@ -194,4 +194,28 @@ def test_auto_detects_pasted_iam_word_archive(tmp_path: Path) -> None:
     assert sample["reference"] == "hello"
     assert sample["reference_source"] == "words.txt"
     assert sample["crop_bbox"] == [0, 0, 32, 18]
-    assert Path(sample["crop_path"]).read_bytes() == Path(sample["image_path"]).read_bytes()
+    with Image.open(sample["crop_path"]) as crop:
+        assert crop.size == (32 * 3 + 32, 18 * 3 + 32)
+        assert crop.mode == "L"
+
+
+def test_auto_detects_pasted_iam_line_archive_and_upscales_crop(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    image_dir = data_dir / "archive" / "iam_lines" / "lines" / "a01"
+    image_dir.mkdir(parents=True)
+    Image.new("RGB", (80, 24), "white").save(image_dir / "a01-000u-00-00.png")
+    (data_dir / "archive" / "iam_lines" / "lines.txt").write_text(
+        "# IAM lines\na01-000u-00-00 ok 154 1 0 0 80 24 Hello handwritten line\n",
+        encoding="utf-8",
+    )
+
+    [sample] = prepare_dataset(data_dir, tmp_path / "run")
+
+    assert sample["id"] == "a01-000u-00-00"
+    assert sample["reference"] == "Hello handwritten line"
+    assert sample["reference_source"] == "lines.txt"
+    assert sample["writer_id"] == "a01"
+    assert sample["crop_bbox"] == [0, 0, 80, 24]
+    with Image.open(sample["crop_path"]) as crop:
+        assert crop.size == (80 * 3 + 32, 24 * 3 + 32)
+        assert crop.mode == "L"

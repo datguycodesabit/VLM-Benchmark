@@ -10,16 +10,17 @@ from __future__ import annotations
 
 import hashlib
 import random
-import shutil
 import warnings
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
 
-from PIL import Image, UnidentifiedImageError
+from PIL import Image, ImageOps, UnidentifiedImageError
 
 _IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg"}
 _PADDING = 20
+_MODEL_SCALE = 3
+_MODEL_BORDER = 16
 
 
 def _sha256_bytes(data: bytes) -> str:
@@ -182,6 +183,18 @@ def _validate_image(path: Path, sample_id: str) -> tuple[int, int]:
         raise ValueError(f"Image for sample {sample_id!r} cannot be decoded: {exc}") from exc
 
 
+def _save_model_crop(source: Path, destination: Path, bbox: tuple[int, int, int, int]) -> None:
+    """Make a consistent, enlarged grayscale crop for a vision model."""
+    with Image.open(source) as image:
+        crop = image.convert("L").crop(bbox)
+        crop = ImageOps.autocontrast(crop)
+        crop = crop.resize(
+            (crop.width * _MODEL_SCALE, crop.height * _MODEL_SCALE), Image.Resampling.LANCZOS
+        )
+        crop = ImageOps.expand(crop, border=_MODEL_BORDER, fill=255)
+        crop.save(destination, format="PNG")
+
+
 def _word_annotations(path: Path) -> dict[str, str]:
     """Read IAM's word table, whose final field is the word transcription."""
     annotations: dict[str, str] = {}
@@ -203,6 +216,137 @@ def _word_annotations(path: Path) -> dict[str, str]:
     if not annotations:
         raise ValueError(f"IAM word annotation file contains no samples: {path}")
     return annotations
+
+
+def _line_annotations(path: Path) -> dict[str, str]:
+    """Read IAM's ASCII line table (ID, status, geometry, transcription)."""
+    annotations: dict[str, str] = {}
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError as exc:
+        raise ValueError(f"Cannot read IAM line annotations: {path}: {exc}") from exc
+    for line in lines:
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        fields = line.split()
+        # ID, status, graylevel, components, x, y, width, height, text...
+        if len(fields) < 9:
+            continue
+        try:
+            [int(value) for value in fields[2:8]]
+        except ValueError:
+            continue
+        sample_id, text = fields[0], " ".join(fields[8:]).strip()
+        if not text:
+            continue
+        previous = annotations.get(sample_id)
+        if previous is not None and previous != text:
+            raise ValueError(f"Conflicting line annotations for {sample_id!r} in {path}")
+        annotations[sample_id] = text
+    if not annotations:
+        raise ValueError(f"IAM line annotation file contains no samples: {path}")
+    return annotations
+
+
+def _prepare_line_dataset(
+    data_dir: Path,
+    output_dir: Path,
+    limit: int | None,
+    seed: int,
+) -> list[dict[str, Any]]:
+    """Prepare IAM line images paired with lines.txt transcriptions."""
+    all_images = _files_with_suffix(data_dir, _IMAGE_SUFFIXES)
+    if output_dir.is_relative_to(data_dir):
+        all_images = [path for path in all_images if output_dir not in path.parents]
+    image_by_id: dict[str, Path] = {}
+    for image_path in all_images:
+        previous = image_by_id.get(image_path.stem)
+        if previous is not None:
+            raise ValueError(f"Duplicate image ID {image_path.stem!r}: {previous} and {image_path}")
+        image_by_id[image_path.stem] = image_path
+
+    matches: list[tuple[int, Path, dict[str, str]]] = []
+    for candidate in sorted(data_dir.rglob("lines*.txt")):
+        try:
+            annotations = _line_annotations(candidate)
+        except ValueError:
+            continue
+        count = len(set(annotations) & set(image_by_id))
+        if count:
+            matches.append((count, candidate, annotations))
+    if not matches:
+        raise ValueError(
+            "No IAM lines.txt matching the pasted images was found. "
+            "Expected line images and a lines.txt annotation file."
+        )
+    _, annotation_path, annotations = max(matches, key=lambda item: (item[0], str(item[1])))
+
+    override_dirs = [data_dir / "references", annotation_path.parent / "references"]
+    override_paths: list[Path] = []
+    for directory in override_dirs:
+        override_paths.extend(_files_with_suffix(directory, {".txt"}))
+    reference_by_id = _index_by_stem(override_paths, "reference", ".txt") if override_paths else {}
+
+    records: list[dict[str, Any]] = []
+    for sample_id in sorted(set(annotations) & set(image_by_id)):
+        image_path = image_by_id[sample_id]
+        try:
+            width, height = _validate_image(image_path, sample_id)
+        except ValueError as exc:
+            warnings.warn(f"Skipping invalid IAM line sample {sample_id!r}: {exc}", stacklevel=2)
+            continue
+        reference = annotations[sample_id]
+        reference_source = "lines.txt"
+        reference_bytes = reference.encode("utf-8")
+        reference_path = reference_by_id.get(sample_id)
+        if reference_path is not None:
+            reference, reference_bytes = _read_reference(reference_path, sample_id)
+            reference_source = "txt"
+        records.append(
+            {
+                "id": sample_id,
+                "image_path": image_path,
+                "reference": reference,
+                "reference_bytes": reference_bytes,
+                "reference_source": reference_source,
+                "writer_id": sample_id.split("-", 1)[0],
+                "crop_bbox": [0, 0, width, height],
+                "annotation_path": annotation_path,
+            }
+        )
+
+    if not records:
+        raise ValueError("No valid IAM line images matched lines.txt")
+    if limit is not None:
+        if limit > len(records):
+            raise ValueError(f"Requested {limit} samples, but only {len(records)} are available")
+        chosen = set(random.Random(seed).sample([record["id"] for record in records], limit))
+        records = [record for record in records if record["id"] in chosen]
+
+    crop_dir = output_dir / "crops"
+    crop_dir.mkdir(parents=True, exist_ok=True)
+    results: list[dict[str, Any]] = []
+    for record in records:
+        crop_path = crop_dir / f"{record['id']}.png"
+        _save_model_crop(record["image_path"], crop_path, tuple(record["crop_bbox"]))
+        results.append(
+            {
+                "id": record["id"],
+                "image_path": str(record["image_path"]),
+                "crop_path": str(crop_path.resolve()),
+                "reference": record["reference"],
+                "reference_source": record["reference_source"],
+                "writer_id": record["writer_id"],
+                "crop_bbox": record["crop_bbox"],
+                "hashes": {
+                    "image": _sha256_file(record["image_path"]),
+                    "xml": _sha256_file(record["annotation_path"]),
+                    "reference": _sha256_bytes(record["reference_bytes"]),
+                    "crop": _sha256_file(crop_path),
+                },
+            }
+        )
+    return results
 
 
 def _prepare_word_dataset(
@@ -293,7 +437,7 @@ def _prepare_word_dataset(
     results: list[dict[str, Any]] = []
     for record in records:
         crop_path = crop_dir / f"{record['id']}.png"
-        shutil.copyfile(record["image_path"], crop_path)
+        _save_model_crop(record["image_path"], crop_path, tuple(record["crop_bbox"]))
         results.append(
             {
                 "id": record["id"],
@@ -325,11 +469,11 @@ def prepare_dataset(
 
     Form inputs are ``images/``, ``xml/``, and optionally ``references/`` beneath
     ``data_dir``. If no form images are present, the function auto-detects a
-    pasted IAM word archive by finding ``words*.txt`` and matching PNG/JPEG
-    stems recursively. Word-table text or ``references/<ID>.txt`` becomes the
-    reference, and each word image is copied as its own crop. The returned
-    ``crop_bbox`` is the actual clipped box saved to the crop, including 20
-    pixels of padding where form image bounds allow it.
+    pasted IAM line archive (``lines*.txt`` plus matching images) or word
+    archive (``words*.txt`` plus matching images) recursively. Every model crop
+    is converted to grayscale, contrast-normalized, enlarged 3x, and padded
+    with a white border so small handwriting is easier for vision models to
+    read. The returned ``crop_bbox`` records the source-image coordinates.
     """
     data_dir = Path(data_dir).expanduser().resolve()
     output_dir = Path(output_dir).expanduser().resolve()
@@ -344,8 +488,17 @@ def prepare_dataset(
     # A populated images/ directory is an explicit form dataset request. Keep
     # its missing-XML error useful; only fall back to word auto-detection when
     # no form images were supplied at all.
-    if not form_images and (not xml_dir.exists() or not form_xml):
-        return _prepare_word_dataset(data_dir, output_dir, limit, seed, write_references)
+    if not form_images:
+        line_files = sorted(data_dir.rglob("lines*.txt"))
+        if line_files:
+            try:
+                return _prepare_line_dataset(data_dir, output_dir, limit, seed)
+            except ValueError as line_error:
+                # A non-IAM lines file should not hide a valid word archive.
+                if not any(data_dir.rglob("words*.txt")):
+                    raise line_error
+        if not xml_dir.exists() or not form_xml:
+            return _prepare_word_dataset(data_dir, output_dir, limit, seed, write_references)
     if reference_dir.exists() and not reference_dir.is_dir():
         raise ValueError(f"Reference path is not a directory: {reference_dir}")
 
@@ -448,8 +601,7 @@ def prepare_dataset(
 
         crop_path = crop_dir / f"{sample_id}.png"
         try:
-            with Image.open(image_path) as image:
-                image.crop(crop_bbox).save(crop_path, format="PNG")
+            _save_model_crop(image_path, crop_path, crop_bbox)
         except (OSError, ValueError, UnidentifiedImageError) as exc:
             raise ValueError(f"Cannot crop image for sample {sample_id!r}: {exc}") from exc
 

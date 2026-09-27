@@ -20,10 +20,15 @@ from .metrics import score
 from .ollama import OllamaClient
 
 PROMPT = (
-    "Transcribe all handwriting in this image exactly as written, in reading order. "
-    "Preserve spelling, capitalization, punctuation, and errors. Do not correct or "
-    "complete the text. Return only the transcription, with no explanation, "
-    "preamble, or Markdown fences."
+    "You are an exact English handwriting OCR engine. Read only the visible "
+    "handwriting in the image and transcribe it exactly as written. Preserve "
+    "spelling, capitalization, punctuation, apostrophes, and visible errors. "
+    "Return only the transcription. Never describe the image, explain your "
+    "answer, translate, summarize, correct, or complete the text. Do not add "
+    "labels, numbering, quotes, Markdown, or a preamble. For a single word or "
+    "punctuation mark, return exactly that word or mark and nothing else. If the "
+    "writing is uncertain, make your best character-level transcription instead "
+    "of returning a description."
 )
 UPSTREAM_COMMIT = "fd4bd0ae44db0f57f7dcb0e301a0a718d3e6159f"
 

@@ -93,10 +93,13 @@ The importer skips unreadable or truncated word images and prints a warning.
 The current archive contains one such image. IAM data remains local and is
 excluded from Git by `.gitignore`.
 
-The importer also accepts the IAM form dataset. Put form images in
-`data/images`, matching XML files in `data/xml`, and optional reviewed text
-files in `data/references`. Form crops exclude the printed prompt, so the model
-has to read the handwriting.
+The importer also accepts pasted IAM line or form data. For line data, keep
+the line images and `lines.txt` anywhere below `data`; matching file stems are
+paired automatically. For form data, put images in `data/images`, matching XML
+files in `data/xml`, and optional reviewed text files in `data/references`.
+Form crops exclude the printed prompt, so the model has to read the handwriting.
+All crops are converted to grayscale, contrast-normalized, enlarged 3x, and
+given a white border before they are sent to Ollama.
 
 ## Results
 
