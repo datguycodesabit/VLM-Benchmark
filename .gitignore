@@ -1,0 +1,39 @@
+# Python environments, caches, and build outputs
+.venv/
+venv/
+env/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.ruff_cache/
+*.egg-info/
+build/
+dist/
+.coverage
+.coverage.*
+htmlcov/
+coverage.xml
+
+# Credentials and machine-local configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+.codex/
+.agents/
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
+*.log
+
+# User-supplied IAM data and benchmark outputs
+/runs/
+/data/**
+!/data/images/
+!/data/images/.gitkeep
+!/data/xml/
+!/data/xml/.gitkeep
+!/data/references/
+!/data/references/.gitkeep

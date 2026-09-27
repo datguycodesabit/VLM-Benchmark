@@ -1,0 +1,83 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    name: Test / ${{ matrix.os }} / Python ${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            python-version: '3.11'
+          - os: ubuntu-latest
+            python-version: '3.12'
+          - os: ubuntu-latest
+            python-version: '3.13'
+          - os: macos-latest
+            python-version: '3.12'
+          - os: windows-latest
+            python-version: '3.12'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --extra dev --frozen
+      - run: uv run pytest
+
+  quality-and-build:
+    name: Quality and package build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+      - run: uv sync --extra dev --frozen
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+      - run: uv build
+      - name: Verify distribution contents
+        shell: bash
+        run: |
+          uv run python - <<'PY'
+          import tarfile
+          import zipfile
+          from pathlib import Path
+
+          forbidden = ("data/", "runs/", ".venv/", ".github/")
+          artifacts = list(Path("dist").glob("*.whl")) + list(Path("dist").glob("*.tar.gz"))
+          assert len(artifacts) == 2, artifacts
+          for artifact in artifacts:
+              names = (zipfile.ZipFile(artifact).namelist() if artifact.suffix == ".whl"
+                       else tarfile.open(artifact).getnames())
+              assert not any(name.startswith(prefix) for name in names for prefix in forbidden), names
+              assert any(name.endswith("LICENSE") for name in names), names
+              assert any(name.endswith("NOTICE") for name in names), names
+          PY
+      - name: Verify installed wheel outside checkout
+        shell: bash
+        run: |
+          install_dir="${RUNNER_TEMP}/vlm-bench-install"
+          uv venv --python 3.12 "$install_dir"
+          uv pip install --python "$install_dir/bin/python" dist/*.whl
+          (cd "$RUNNER_TEMP" && "$install_dir/bin/vlm-bench" --help)

@@ -1,0 +1,37 @@
+name: Bug report
+description: Report a reproducible problem with the benchmark.
+title: "[Bug]: "
+labels: [bug]
+body:
+  - type: markdown
+    attributes:
+      value: Please do not attach IAM images, reference transcriptions, run manifests, or other private benchmark data.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What happened?
+      description: Include the command or step and the observed behavior. Remove private paths and data.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What did you expect?
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: Python, operating system, Ollama version, and model tag if relevant. Do not include private paths.
+      placeholder: Python 3.12, macOS, Ollama version, model tag
+    validations:
+      required: false
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction details
+      description: Use synthetic or redacted examples only.
+      render: text
+    validations:
+      required: false

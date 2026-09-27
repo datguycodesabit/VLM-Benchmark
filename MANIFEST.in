@@ -1,0 +1,10 @@
+include LICENSE NOTICE README.md CONTRIBUTING.md SECURITY.md CHANGELOG.md
+include pyproject.toml
+recursive-include src *.py
+recursive-include tests *.py
+prune data
+prune runs
+prune .venv
+prune .git
+prune .github
+global-exclude __pycache__ *.py[cod] .DS_Store .env .env.* *.pem *.key

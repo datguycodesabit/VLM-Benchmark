@@ -1,0 +1,12 @@
+This project adapts code from PyaesoneP/vlm-ocr-research (Apache-2.0):
+https://github.com/PyaesoneP/vlm-ocr-research
+Source commit: fd4bd0ae44db0f57f7dcb0e301a0a718d3e6159f
+
+Adapted components: benchmark/metrics.py (whitespace normalization and
+Levenshtein scoring), scripts/crop_handwritten.py and
+scripts/generate_ground_truth.py (IAM handwritten-region extraction).
+
+Modifications include local Ollama inference, folder-based dataset validation,
+reference overrides, reproducible manifests, edit-count aggregation, resumable
+runs, and Excel/CSV/JSONL exports. The upstream model-specific environments,
+cloud evaluation pipelines, dataset, and published results are not included.
