@@ -24,6 +24,8 @@ def parser():
     )
     prepare.add_argument("--data", type=Path, default=Path("data"))
     prepare.add_argument("--output", type=Path, help="Default: DATA/prepared")
+    prepare.add_argument("--limit", type=int, help="Prepare a reproducible subset")
+    prepare.add_argument("--seed", type=int, default=42)
     models = sub.add_parser(
         "models", help="List locally installed Ollama models and their capabilities"
     )
@@ -87,12 +89,12 @@ def main(argv=None):
     try:
         if args.command == "prepare":
             output = args.output or args.data / "prepared"
-            samples = prepare_dataset(args.data, output, write_references=True)
-            _atomic_json(output / "dataset.json", samples)
-            print(f"Prepared {len(samples)} forms in {output.resolve()}")
-            print(
-                f"Review reference text in {(args.data / 'references').resolve()} and the saved crops before benchmarking."
+            samples = prepare_dataset(
+                args.data, output, limit=args.limit, seed=args.seed, write_references=True
             )
+            _atomic_json(output / "dataset.json", samples)
+            print(f"Prepared {len(samples)} samples in {output.resolve()}")
+            print("Review the references and saved crops before benchmarking.")
         elif args.command == "models":
             with OllamaClient(base_url=args.base_url, timeout=args.timeout) as client:
                 for model in client.list_models():

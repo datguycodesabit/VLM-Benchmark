@@ -176,3 +176,22 @@ def test_subset_is_reproducible_sorted_and_rejects_oversized_limit(tmp_path: Pat
     assert len(first) == 2
     with pytest.raises(ValueError, match="only 4 are available"):
         prepare_dataset(data_dir, tmp_path / "run-3", limit=5)
+
+
+def test_auto_detects_pasted_iam_word_archive(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    image_dir = data_dir / "archive" / "iam_words" / "words" / "a01" / "a01-000u"
+    image_dir.mkdir(parents=True)
+    Image.new("L", (32, 18), "white").save(image_dir / "a01-000u-00-00.png")
+    (data_dir / "archive" / "iam_words" / "words.txt").write_text(
+        "# IAM words\na01-000u-00-00 ok 154 1 1 1 10 10 NN hello\n",
+        encoding="utf-8",
+    )
+
+    [sample] = prepare_dataset(data_dir, tmp_path / "run")
+
+    assert sample["id"] == "a01-000u-00-00"
+    assert sample["reference"] == "hello"
+    assert sample["reference_source"] == "words.txt"
+    assert sample["crop_bbox"] == [0, 0, 32, 18]
+    assert Path(sample["crop_path"]).read_bytes() == Path(sample["image_path"]).read_bytes()

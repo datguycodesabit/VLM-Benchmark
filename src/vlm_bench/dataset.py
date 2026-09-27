@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import hashlib
 import random
+import shutil
+import warnings
 import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
@@ -180,6 +182,138 @@ def _validate_image(path: Path, sample_id: str) -> tuple[int, int]:
         raise ValueError(f"Image for sample {sample_id!r} cannot be decoded: {exc}") from exc
 
 
+def _word_annotations(path: Path) -> dict[str, str]:
+    """Read IAM's word table, whose final field is the word transcription."""
+    annotations: dict[str, str] = {}
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError as exc:
+        raise ValueError(f"Cannot read IAM word annotations: {path}: {exc}") from exc
+    for line in lines:
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        fields = line.split()
+        if len(fields) < 2:
+            continue
+        sample_id, text = fields[0], fields[-1]
+        previous = annotations.get(sample_id)
+        if previous is not None and previous != text:
+            raise ValueError(f"Conflicting word annotations for {sample_id!r} in {path}")
+        annotations[sample_id] = text
+    if not annotations:
+        raise ValueError(f"IAM word annotation file contains no samples: {path}")
+    return annotations
+
+
+def _prepare_word_dataset(
+    data_dir: Path,
+    output_dir: Path,
+    limit: int | None,
+    seed: int,
+    write_references: bool,
+) -> list[dict[str, Any]]:
+    """Prepare pasted IAM word images when no form/XML layout is present."""
+    all_images = _files_with_suffix(data_dir, _IMAGE_SUFFIXES)
+    if output_dir.is_relative_to(data_dir):
+        all_images = [path for path in all_images if output_dir not in path.parents]
+    image_by_id: dict[str, Path] = {}
+    for image_path in all_images:
+        previous = image_by_id.get(image_path.stem)
+        if previous is not None:
+            raise ValueError(f"Duplicate image ID {image_path.stem!r}: {previous} and {image_path}")
+        image_by_id[image_path.stem] = image_path
+    if not image_by_id:
+        raise ValueError(f"No image files found under {data_dir}")
+
+    candidates = sorted(data_dir.rglob("words*.txt"))
+    matches: list[tuple[int, Path, dict[str, str]]] = []
+    for candidate in candidates:
+        try:
+            annotations = _word_annotations(candidate)
+        except ValueError:
+            continue
+        count = len(set(annotations) & set(image_by_id))
+        if count:
+            matches.append((count, candidate, annotations))
+    if not matches:
+        raise ValueError(
+            "No IAM words.txt matching the pasted images was found. "
+            "For form data, provide images/ and matching xml/ directories."
+        )
+    _, annotation_path, annotations = max(matches, key=lambda item: (item[0], str(item[1])))
+
+    override_dirs = [data_dir / "references", annotation_path.parent / "references"]
+    override_paths: list[Path] = []
+    for directory in override_dirs:
+        override_paths.extend(_files_with_suffix(directory, {".txt"}))
+    reference_by_id = _index_by_stem(override_paths, "reference", ".txt") if override_paths else {}
+
+    records: list[dict[str, Any]] = []
+    for sample_id in sorted(set(annotations) & set(image_by_id)):
+        image_path = image_by_id[sample_id]
+        try:
+            width, height = _validate_image(image_path, sample_id)
+        except ValueError as exc:
+            # Word archives in the wild occasionally contain an empty or
+            # truncated crop. It cannot be scored, so omit only that sample
+            # and make the omission visible to the caller.
+            warnings.warn(f"Skipping invalid IAM word sample {sample_id!r}: {exc}", stacklevel=2)
+            continue
+        reference = annotations[sample_id]
+        reference_source = "words.txt"
+        reference_bytes = reference.encode("utf-8")
+        reference_path = reference_by_id.get(sample_id)
+        if reference_path is not None:
+            reference, reference_bytes = _read_reference(reference_path, sample_id)
+            reference_source = "txt"
+        if not reference.strip():
+            raise ValueError(f"Reference for sample {sample_id!r} is empty")
+        records.append(
+            {
+                "id": sample_id,
+                "image_path": image_path,
+                "reference": reference,
+                "reference_bytes": reference_bytes,
+                "reference_source": reference_source,
+                "reference_path": reference_path,
+                "writer_id": sample_id.split("-", 1)[0],
+                "crop_bbox": [0, 0, width, height],
+                "annotation_path": annotation_path,
+            }
+        )
+
+    if limit is not None:
+        if limit > len(records):
+            raise ValueError(f"Requested {limit} samples, but only {len(records)} are available")
+        chosen = set(random.Random(seed).sample([record["id"] for record in records], limit))
+        records = [record for record in records if record["id"] in chosen]
+
+    crop_dir = output_dir / "crops"
+    crop_dir.mkdir(parents=True, exist_ok=True)
+    results: list[dict[str, Any]] = []
+    for record in records:
+        crop_path = crop_dir / f"{record['id']}.png"
+        shutil.copyfile(record["image_path"], crop_path)
+        results.append(
+            {
+                "id": record["id"],
+                "image_path": str(record["image_path"]),
+                "crop_path": str(crop_path.resolve()),
+                "reference": record["reference"],
+                "reference_source": record["reference_source"],
+                "writer_id": record["writer_id"],
+                "crop_bbox": record["crop_bbox"],
+                "hashes": {
+                    "image": _sha256_file(record["image_path"]),
+                    "xml": _sha256_file(record["annotation_path"]),
+                    "reference": _sha256_bytes(record["reference_bytes"]),
+                    "crop": _sha256_file(crop_path),
+                },
+            }
+        )
+    return results
+
+
 def prepare_dataset(
     data_dir: Path,
     output_dir: Path,
@@ -189,10 +323,13 @@ def prepare_dataset(
 ) -> list[dict[str, Any]]:
     """Validate, reproducibly select, and crop IAM handwriting samples.
 
-    Expected inputs are ``images/``, ``xml/``, and optionally ``references/``
-    beneath ``data_dir``. References in ``references/<ID>.txt`` override the
-    text in XML. The returned ``crop_bbox`` is the actual clipped box saved to
-    the crop, including 20 pixels of padding where image bounds allow it.
+    Form inputs are ``images/``, ``xml/``, and optionally ``references/`` beneath
+    ``data_dir``. If no form images are present, the function auto-detects a
+    pasted IAM word archive by finding ``words*.txt`` and matching PNG/JPEG
+    stems recursively. Word-table text or ``references/<ID>.txt`` becomes the
+    reference, and each word image is copied as its own crop. The returned
+    ``crop_bbox`` is the actual clipped box saved to the crop, including 20
+    pixels of padding where form image bounds allow it.
     """
     data_dir = Path(data_dir).expanduser().resolve()
     output_dir = Path(output_dir).expanduser().resolve()
@@ -202,14 +339,17 @@ def prepare_dataset(
 
     if limit is not None and limit <= 0:
         raise ValueError("limit must be a positive integer when provided")
-    if not image_dir.exists() or not image_dir.is_dir():
-        raise ValueError(f"Image directory does not exist: {image_dir}")
-    if not xml_dir.exists() or not xml_dir.is_dir():
-        raise ValueError(f"XML directory does not exist: {xml_dir}")
+    form_images = _files_with_suffix(image_dir, _IMAGE_SUFFIXES)
+    form_xml = _files_with_suffix(xml_dir, {".xml"})
+    # A populated images/ directory is an explicit form dataset request. Keep
+    # its missing-XML error useful; only fall back to word auto-detection when
+    # no form images were supplied at all.
+    if not form_images and (not xml_dir.exists() or not form_xml):
+        return _prepare_word_dataset(data_dir, output_dir, limit, seed, write_references)
     if reference_dir.exists() and not reference_dir.is_dir():
         raise ValueError(f"Reference path is not a directory: {reference_dir}")
 
-    image_paths = _files_with_suffix(image_dir, _IMAGE_SUFFIXES)
+    image_paths = form_images
     if not image_paths:
         raise ValueError(f"No PNG, JPG, or JPEG images found in {image_dir}")
 

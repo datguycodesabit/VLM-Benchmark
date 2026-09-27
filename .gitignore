@@ -31,6 +31,7 @@ Thumbs.db
 # User-supplied IAM data and benchmark outputs
 /runs/
 /data/**
+!/data/README.md
 !/data/images/
 !/data/images/.gitkeep
 !/data/xml/
