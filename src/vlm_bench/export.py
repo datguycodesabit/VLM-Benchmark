@@ -287,6 +287,17 @@ def _write_workbook(
                 ),
             )
         )
+    if manifest.get("schema_version") == 2:
+        from .research import research_reports
+
+        report = research_reports(sample_rows, dict(manifest, warmups=warmup_rows or []))
+        tracks, pairs, costs = _research_tables(report)
+        for title, rows in (
+            ("Task Results", tracks),
+            ("Paired Comparisons", pairs),
+            ("Cost Scenarios", costs),
+        ):
+            tables.append((title, rows, _table_columns(rows)))
     for title, rows, columns in tables:
         worksheet = workbook.create_sheet(title)
         _append_table(worksheet, title, columns, rows, overflow_rows)
@@ -333,6 +344,16 @@ def _read_results(path: Path) -> list[dict[str, Any]]:
                 raise ValueError(f"{path.name} line {line_number} must contain a JSON object")
             records.append(record)
     return records
+
+
+def _research_tables(report):
+    tracks, pairs = [], []
+    for track, values in report["tracks"].items():
+        tracks.extend({"track": track, **row} for row in values["model_results"])
+        pairs.extend({"track": track, **row} for row in values["paired_differences"])
+    cost_report = report.get("cost_scenarios", {})
+    costs = cost_report.get("scenarios", []) if isinstance(cost_report, dict) else cost_report
+    return tracks, pairs, costs
 
 
 def export_run(run_dir: Path, formats: list[str]) -> list[Path]:
@@ -389,6 +410,22 @@ def export_run(run_dir: Path, formats: list[str]) -> list[Path]:
         if record.get("status") != "success" or record.get("error")
     ]
     outputs: list[Path] = []
+    if manifest.get("schema_version") == 2:
+        from .research import research_reports
+
+        report = research_reports(records, dict(manifest, warmups=warmups))
+        research_path = run_dir / "research.json"
+        research_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
+        outputs.append(research_path)
+        tracks, pairs, costs = _research_tables(report)
+        if "csv" in normalized_formats:
+            for name, values in (("tracks", tracks), ("paired", pairs), ("costs", costs)):
+                path = run_dir / f"{name}.csv"
+                _write_csv(path, values, _table_columns(values))
+                outputs.append(path)
+        # Mixed-task aggregate accuracy is descriptive, not a research ranking.
+        for row in summary_rows:
+            row["rank"] = None
 
     if "xlsx" in normalized_formats:
         workbook_path = run_dir / "results.xlsx"

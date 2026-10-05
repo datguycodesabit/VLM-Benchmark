@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import hashlib
+import json
 from pathlib import Path
 
 import pytest
 from PIL import Image
 
-from vlm_bench.dataset import prepare_dataset
+from vlm_bench.dataset import check_dataset, prepare_dataset, split_dataset
 
 
 def _line(text: str, boxes: list[tuple[int, int, int, int]]) -> str:
@@ -68,7 +69,7 @@ def test_crops_union_of_retained_handwriting_and_uses_same_lines_for_xml_referen
     assert Path(sample["image_path"]).is_absolute()
     assert Path(sample["crop_path"]).is_absolute()
     with Image.open(sample["crop_path"]) as crop:
-        assert crop.size == (70 * 3 + 32, 68 * 3 + 32)
+        assert crop.size == (70, 68)
     assert all(len(value) == 64 for value in sample["hashes"].values())
 
 
@@ -195,11 +196,11 @@ def test_auto_detects_pasted_iam_word_archive(tmp_path: Path) -> None:
     assert sample["reference_source"] == "words.txt"
     assert sample["crop_bbox"] == [0, 0, 32, 18]
     with Image.open(sample["crop_path"]) as crop:
-        assert crop.size == (32 * 3 + 32, 18 * 3 + 32)
+        assert crop.size == (32, 18)
         assert crop.mode == "L"
 
 
-def test_auto_detects_pasted_iam_line_archive_and_upscales_crop(tmp_path: Path) -> None:
+def test_auto_detects_pasted_iam_line_archive_and_preserves_crop_by_default(tmp_path: Path) -> None:
     data_dir = tmp_path / "data"
     image_dir = data_dir / "archive" / "iam_lines" / "lines" / "a01"
     image_dir.mkdir(parents=True)
@@ -214,8 +215,161 @@ def test_auto_detects_pasted_iam_line_archive_and_upscales_crop(tmp_path: Path) 
     assert sample["id"] == "a01-000u-00-00"
     assert sample["reference"] == "Hello handwritten line"
     assert sample["reference_source"] == "lines.txt"
-    assert sample["writer_id"] == "a01"
+    assert sample["writer_id"] is None
+    assert sample["sample_type"] == "line"
     assert sample["crop_bbox"] == [0, 0, 80, 24]
     with Image.open(sample["crop_path"]) as crop:
-        assert crop.size == (80 * 3 + 32, 24 * 3 + 32)
+        assert crop.size == (80, 24)
+        assert crop.mode == "RGB"
+
+
+def _paired_sample(data_dir: Path, relative_id: str, text: str, *, size=(32, 16)) -> None:
+    image_path = data_dir / "images" / f"{relative_id}.png"
+    text_path = data_dir / "text" / f"{relative_id}.txt"
+    image_path.parent.mkdir(parents=True, exist_ok=True)
+    text_path.parent.mkdir(parents=True, exist_ok=True)
+    Image.new("RGB", size, "white").save(image_path)
+    text_path.write_text(text, encoding="utf-8")
+
+
+def test_paired_layout_matches_relative_paths_and_freezes_original_inputs(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    _paired_sample(data_dir, "exam-2006/page-03/line-02", "Reviewed words")
+
+    [sample] = prepare_dataset(data_dir, tmp_path / "prepared")
+
+    assert sample["id"] == "exam-2006/page-03/line-02"
+    assert sample["reference"] == "Reviewed words"
+    assert sample["writer_id"] is None
+    assert sample["sample_type"] == "line"
+    assert sample["preprocess"] == "original"
+    assert Path(sample["crop_path"]).read_bytes() == Path(sample["image_path"]).read_bytes()
+    manifest = json.loads((tmp_path / "prepared" / "dataset-manifest.json").read_text())
+    assert manifest["sample_ids"] == [sample["id"]]
+    assert manifest["samples"][0]["reference"] == "Reviewed words"
+    assert manifest["samples"][0]["hashes"]["image"] == sample["hashes"]["image"]
+
+
+def test_paired_layout_accepts_references_directory(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    _paired_sample(data_dir, "exam-2006/line-02", "A reviewed line")
+    (data_dir / "text").rename(data_dir / "references")
+
+    [sample] = prepare_dataset(data_dir, tmp_path / "prepared")
+
+    assert sample["reference_source"] == "references"
+
+
+def test_paired_layout_rejects_ambiguous_reference_directories(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    _paired_sample(data_dir, "exam-2006/line-02", "A reviewed line")
+    (data_dir / "references").mkdir()
+
+    with pytest.raises(ValueError, match="ambiguous"):
+        prepare_dataset(data_dir, tmp_path / "prepared")
+
+
+def test_paired_validation_reports_missing_corrupt_and_empty_samples(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    _paired_sample(data_dir, "doc/valid", "Readable")
+    (data_dir / "images" / "doc" / "missing.png").write_bytes(b"not an image")
+    (data_dir / "text" / "doc" / "empty.txt").write_text(" \n", encoding="utf-8")
+
+    report = check_dataset(data_dir)
+
+    codes = {issue["code"] for issue in report["issues"]}
+    assert not report["valid"]
+    assert {"missing_reference", "missing_image", "corrupt_image", "empty_reference"} <= codes
+    assert report["counts"]["samples"] == 1
+    with pytest.raises(ValueError, match="files do not match"):
+        prepare_dataset(data_dir, tmp_path / "prepared")
+
+
+def test_paired_metadata_filters_without_relabeling_and_enhanced_is_opt_in(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "data"
+    _paired_sample(data_dir, "exam-a/line-01", "Prose sample")
+    _paired_sample(data_dir, "exam-b/line-01", "Equation sample")
+    metadata = [
+        {
+            "id": "exam-a/line-01",
+            "source_document": "exam-a",
+            "split": "train",
+            "content_type": "prose",
+            "verification_status": "verified",
+        },
+        {
+            "id": "exam-b/line-01",
+            "source_document": "exam-b",
+            "split": "test",
+            "content_type": "equation",
+        },
+    ]
+    (data_dir / "metadata.jsonl").write_text(
+        "\n".join(json.dumps(row) for row in metadata) + "\n", encoding="utf-8"
+    )
+
+    [sample] = prepare_dataset(
+        data_dir,
+        tmp_path / "test-set",
+        split="test",
+        content_type="equation",
+        preprocess="enhanced",
+    )
+
+    assert sample["id"] == "exam-b/line-01"
+    assert sample["split"] == "test"
+    assert sample["content_type"] == "equation"
+    assert sample["verification_status"] is None
+    with Image.open(sample["crop_path"]) as crop:
+        assert crop.size == (32 * 3 + 32, 16 * 3 + 32)
         assert crop.mode == "L"
+    with pytest.raises(ValueError, match="No samples match"):
+        prepare_dataset(data_dir, tmp_path / "wrong-filter", split="train", content_type="equation")
+
+
+def test_iam_line_parser_honors_quality_flags_and_pipe_separator(tmp_path: Path) -> None:
+    data_dir = tmp_path / "data"
+    image_dir = data_dir / "lines"
+    image_dir.mkdir(parents=True)
+    Image.new("RGB", (80, 24), "white").save(image_dir / "a01-000u-00-00.png")
+    Image.new("RGB", (80, 24), "white").save(image_dir / "a01-000u-00-01.png")
+    annotations = "\n".join(
+        (
+            "a01-000u-00-00 | ok | 154 | 1 | 0 | 0 | 80 | 24 | Hello | there",
+            "a01-000u-00-01 | err | 154 | 1 | 0 | 0 | 80 | 24 | Exclude me",
+        )
+    )
+    (data_dir / "lines.txt").write_text(annotations + "\n", encoding="utf-8")
+
+    [sample] = prepare_dataset(data_dir, tmp_path / "prepared", layout="iam-lines")
+
+    assert sample["reference"] == "Hello there"
+    assert sample["sample_type"] == "line"
+
+
+def test_split_dataset_keeps_documents_together_and_rejects_image_leakage() -> None:
+    samples = [
+        {
+            "id": f"doc-{doc}/line-{index}",
+            "source_document": f"doc-{doc}",
+            "hashes": {"image": f"hash-{doc}-{index}"},
+        }
+        for doc in range(5)
+        for index in range(2)
+    ]
+
+    first = split_dataset(samples, seed=8)
+    second = split_dataset(samples, seed=8)
+
+    assert first == second
+    assert {row["split"] for row in first} == {"train", "validation", "test"}
+    by_document = {}
+    for row in first:
+        by_document.setdefault(row["source_document"], set()).add(row["split"])
+    assert all(len(splits) == 1 for splits in by_document.values())
+    leaked = [dict(sample) for sample in samples]
+    leaked[2] = {**leaked[2], "hashes": {"image": samples[0]["hashes"]["image"]}}
+    with pytest.raises(ValueError, match="crosses documents"):
+        split_dataset(leaked)

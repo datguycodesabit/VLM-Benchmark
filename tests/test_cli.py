@@ -1,4 +1,5 @@
 from PIL import Image
+from test_engine import Backend
 from test_runner import FakeClient
 
 from vlm_bench.cli import main
@@ -36,3 +37,36 @@ def test_100_forms_two_models_and_exports(tmp_path):
 def test_cli_empty_folder_clear_error(tmp_path, capsys):
     assert main(["prepare", "--data", str(tmp_path)]) == 1
     assert "Error:" in capsys.readouterr().err
+
+
+def test_paired_check_and_configured_dry_run(tmp_path, monkeypatch, capsys):
+    import json
+
+    from vlm_bench import engine
+
+    data = tmp_path / "paired"
+    (data / "images").mkdir(parents=True)
+    (data / "text").mkdir()
+    Image.new("RGB", (90, 25), "white").save(data / "images" / "line.png")
+    (data / "text" / "line.txt").write_text("hello", encoding="utf-8")
+    assert main(["dataset", "check", "--data", str(data), "--json"]) == 0
+    assert json.loads(capsys.readouterr().out)["valid"]
+    config = tmp_path / "experiment.toml"
+    config.write_text(
+        'version = 1\n[experiment]\nmodels = ["ollama:first", "openai:second"]\n'
+        'data = "nonexistent"\nlayout = "paired"\nseed = 21\n',
+        encoding="utf-8",
+    )
+    original_preview = engine.preview
+    monkeypatch.setattr(
+        engine,
+        "preview",
+        lambda *args, **kwargs: original_preview(*args, **kwargs, backend_factory=Backend),
+    )
+    Backend.calls = []
+    assert main(["run", "--config", str(config), "--data", str(data), "--dry-run"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["sample_ids"] == ["line"]
+    assert [item["execution"] for item in report["models"]] == ["local", "cloud"]
+    assert Backend.calls == []
+    assert not (tmp_path / "runs").exists()

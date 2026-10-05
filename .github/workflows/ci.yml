@@ -38,7 +38,7 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
-      - run: uv sync --extra dev --frozen
+      - run: uv sync --extra dev --extra cloud --frozen
       - run: uv run pytest
 
   quality-and-build:
@@ -52,7 +52,7 @@ jobs:
       - uses: astral-sh/setup-uv@v5
         with:
           enable-cache: true
-      - run: uv sync --extra dev --frozen
+      - run: uv sync --extra dev --extra cloud --frozen
       - run: uv run ruff check .
       - run: uv run ruff format --check .
       - run: uv build

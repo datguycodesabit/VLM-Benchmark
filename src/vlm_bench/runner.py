@@ -248,7 +248,9 @@ def run_benchmark(
     run_dir.mkdir(parents=True)
     try:
         with _lock(run_dir):
-            samples = prepare_dataset(data_dir.resolve(), run_dir, limit=limit, seed=seed)
+            samples = prepare_dataset(
+                data_dir.resolve(), run_dir, limit=limit, seed=seed, preprocess="enhanced"
+            )
             with client_factory(base_url=base_url, timeout=timeout) as client:
                 info = {m: client.validate_model(m) for m in models}
                 manifest = {
@@ -303,8 +305,13 @@ def resume_benchmark(run_dir: Path, progress=print, client_factory=OllamaClient)
                 Path(temporary),
                 limit=manifest["limit"],
                 seed=manifest["seed"],
+                preprocess="enhanced",
             )
-            if _sample_identity(current) != _sample_identity(manifest["samples"]):
+            expected_identity = _sample_identity(manifest["samples"])
+            current_identity = _sample_identity(current)
+            for actual, expected in zip(current_identity, expected_identity):
+                actual["hashes"] = {key: actual["hashes"].get(key) for key in expected["hashes"]}
+            if current_identity != expected_identity:
                 raise ValueError("Dataset or references changed; create a new run")
         for sample in manifest["samples"]:
             crop = Path(sample["crop_path"])
