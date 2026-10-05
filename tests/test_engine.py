@@ -146,3 +146,99 @@ def test_local_request_timing_separates_known_model_load(paired, tmp_path):
     for row in read_records(directory / "results.jsonl"):
         assert row["inference_latency_seconds"] == row["latency_seconds"]
         assert row["load_duration_seconds"] == 0
+
+
+def test_prepared_runs_share_bytes_without_source_or_snapshot(paired, tmp_path):
+    import shutil
+
+    from vlm_bench.snapshot import freeze
+
+    snapshot = tmp_path / "benchmark"
+    freeze(paired, snapshot, limit=2, seed=42)
+    shutil.rmtree(paired)
+    seen = []
+
+    class RecordingBackend(Backend):
+        def transcribe(self, model, path, prompt, options):
+            seen.append((self.provider, path.read_bytes()))
+            return super().transcribe(model, path, prompt, options)
+
+    first = engine.run(
+        models=["ollama:first"],
+        prepared=snapshot,
+        output_dir=tmp_path / "runs",
+        warmup=False,
+        backend_factory=RecordingBackend,
+    )
+    second = engine.run(
+        models=["trocr:second"],
+        prepared=snapshot,
+        output_dir=tmp_path / "runs",
+        warmup=False,
+        backend_factory=RecordingBackend,
+    )
+    a, b = [json.loads((d / "manifest.json").read_text()) for d in (first, second)]
+    assert a["benchmark_fingerprint"] == b["benchmark_fingerprint"]
+    assert [x[1] for x in seen[:2]] == [x[1] for x in seen[2:]]
+    assert a["scoring_version"] == "1"
+    assert a["host"]["dependencies"]["Pillow"]
+    assert a["prompt_hashes"]["prose"]
+    shutil.rmtree(snapshot)
+    engine.resume(first, backend_factory=RecordingBackend)
+    assert len(Backend.calls) == 4
+
+
+@pytest.mark.parametrize(
+    "kwargs",
+    [
+        {"seed": 42},
+        {"limit": 1},
+        {"preprocess": "original"},
+        {"layout": "paired"},
+    ],
+)
+def test_prepared_rejects_selection_before_provider(paired, tmp_path, kwargs):
+    with pytest.raises(ValueError, match="--prepared cannot"):
+        engine.run(
+            models=["ollama:first"], prepared=tmp_path / "absent", backend_factory=Backend, **kwargs
+        )
+    assert Backend.calls == []
+
+
+def test_invalid_controls_fail_before_creating_run(paired, tmp_path):
+    with pytest.raises(ValueError, match="num_beams"):
+        engine.run(
+            paired,
+            ["trocr:second"],
+            tmp_path / "runs",
+            settings={"trocr:second": {"num_beams": 11}},
+            backend_factory=Backend,
+        )
+    assert not (tmp_path / "runs").exists()
+    assert Backend.calls == []
+
+
+def test_cloud_dry_run_records_unsupported_seed_and_token_cap(paired):
+    report = engine.preview(paired, ["chatgpt:first"], backend_factory=Backend)
+    controls = report["models"][0]["controls"]
+    assert {"seed", "temperature", "num_predict"} <= set(controls["unsupported"])
+    assert "seed" not in controls["effective"]
+    assert report["verification_status_counts"] == {"unknown": 3}
+
+
+def test_subscription_ignored_token_cap_does_not_mark_completion_truncated(paired, tmp_path):
+    class CompletedSubscription(Backend):
+        def transcribe(self, *args):
+            raw = super().transcribe(*args)
+            raw["eval_count"] = 100
+            return raw
+
+    directory = engine.run(
+        paired,
+        ["chatgpt:first"],
+        tmp_path / "runs",
+        num_predict=1,
+        warmup=False,
+        backend_factory=CompletedSubscription,
+    )
+    assert all(not row["truncated"] for row in read_records(directory / "results.jsonl"))

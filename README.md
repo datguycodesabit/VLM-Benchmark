@@ -86,25 +86,59 @@ training and evaluation data.
 
 ## Run a comparison
 
-Run three samples first, then increase the limit after checking the input and
-outputs:
+Freeze the reviewed test set once, then use the resulting portable snapshot for
+each model:
 
 ```bash
-uv run vlm-bench run --data data/brothers \
-  --models ollama:qwen2.5vl:3b trocr:microsoft/trocr-base-handwritten \
-  --layout paired --preprocess original --limit 3 --seed 42
+uv run vlm-bench prepare --data data/brothers \
+  --output data/brothers/prepared-test \
+  --layout paired --preprocess original --split test \
+  --content-type prose --limit 100 --seed 42
+
+uv run vlm-bench dataset check --prepared data/brothers/prepared-test
+```
+
+The prepared folder contains the frozen samples, references, metadata, and
+version 2 manifest. Its fingerprint identifies the benchmark. Keep the folder
+together and do not edit it; preparation refuses to overwrite an existing
+snapshot.
+
+Preview and run each model on the same snapshot. `--dry-run` reports the
+fingerprint, sample and verification-status counts, model eligibility, and
+effective controls without sending images:
+
+```bash
+uv run vlm-bench run --prepared data/brothers/prepared-test \
+  --models ollama:qwen2.5vl:3b --dry-run
+
+uv run vlm-bench run --prepared data/brothers/prepared-test \
+  --models ollama:qwen2.5vl:3b
+
+uv run vlm-bench run --prepared data/brothers/prepared-test \
+  --models trocr:microsoft/trocr-base-handwritten
 ```
 
 Use `openai:MODEL_ID` for API models and `chatgpt:MODEL_ID` for models shown by
-the subscription provider's `models` command. Use `--dry-run` to validate the
-dataset and settings without sending images to any model.
+the subscription provider's `models` command. Compare the saved runs after
+recording the run directories printed by each command:
 
-Keep a run's selected samples fixed while comparing models. A run records its
-sample IDs, reference and image hashes, preprocessing, model identifiers, and
-available provider usage. Do not use the evaluation split to select prompts or
-fine-tuning settings. For IAM, choose documented evaluation data where
-available; handwritten TrOCR checkpoints may have trained on IAM, so arbitrary
-IAM samples do not establish writer-independent test performance.
+```bash
+uv run vlm-bench compare \
+  --runs runs/RUN_DIRECTORY_FOR_OLLAMA runs/RUN_DIRECTORY_FOR_TROCR \
+  --output comparisons/brothers-test
+```
+
+The comparison writes `comparison.json`, `comparison.csv`, `paired.csv`, and
+`costs.csv` after checking that the runs used the same benchmark fingerprint.
+Resume an interrupted run with `uv run vlm-bench resume --run runs/YOUR_RUN_DIRECTORY`;
+resume keeps the original snapshot and predictions.
+
+The direct source-data form remains useful for small one-off checks:
+
+```bash
+uv run vlm-bench run --data data/brothers \
+  --models ollama:qwen2.5vl:3b --layout paired --limit 3 --seed 42 --dry-run
+```
 
 The complete CLI examples, dataset split workflow, configuration format, and
 research cautions are in [Experiment setup](docs/EXPERIMENTS.md).
@@ -132,7 +166,9 @@ equations are mathematically equivalent. Unsupported tasks, missing outputs,
 and failures remain visible and do not receive an accuracy rank. Cost estimates
 are left unknown when prices or usage data were not supplied.
 
-Resume a stopped run with:
+The manifest stores the snapshot fingerprint, frozen sample IDs, references,
+hashes, model identifiers, and available provider usage. Resume a stopped run
+with:
 
 ```bash
 uv run vlm-bench resume --run runs/YOUR_RUN_DIRECTORY

@@ -128,63 +128,124 @@ TrOCR checkpoint was trained on IAM, so a random IAM sample is not an
 independent test of that checkpoint. Keep the public-data and Dr. Brothers
 results distinct.
 
-## 4. Run the same samples through each model
+## 4. Freeze the benchmark once
 
-Use a small dry run first. It validates configuration and reports which models
-would receive local or cloud inference without sending images:
-
-```bash
-uv run vlm-bench run --data data/brothers \
-  --models ollama:qwen2.5vl:3b trocr:microsoft/trocr-base-handwritten \
-  --layout paired --split test --content-type prose \
-  --limit 3 --seed 42 --dry-run
-```
-
-Then run the comparison:
+Prepare a portable snapshot after checking references and installing the
+document split. The snapshot freezes the selected images, references, metadata,
+preprocessing profile, sample IDs, and their hashes:
 
 ```bash
-uv run vlm-bench run --data data/brothers \
-  --models ollama:qwen2.5vl:3b trocr:microsoft/trocr-base-handwritten \
-  --layout paired --split test --content-type prose \
-  --limit 100 --seed 42
+uv run vlm-bench prepare --data data/brothers \
+  --output data/brothers/prepared-test \
+  --layout paired --preprocess original --split test \
+  --content-type prose --limit 100 --seed 42
 ```
 
-To include a subscription or API model, list its explicit selector with the
-others. `doctor` checks provider setup, dependencies, and model availability:
+The output directory must not already exist. Prepared snapshots use manifest
+version 2 and include the inputs needed to run elsewhere; keep the complete
+folder together and treat it as immutable. To make another selection or
+preprocessing condition, prepare a different snapshot directory. Check the
+saved snapshot before inference:
+
+```bash
+uv run vlm-bench dataset check --prepared data/brothers/prepared-test
+```
+
+This check reports the snapshot version, sample count, and benchmark
+fingerprint. The fingerprint identifies the frozen benchmark and is carried
+into each run so separate model runs can be checked against the same inputs.
+
+## 5. Preview and run each model on the snapshot
+
+Start with a dry run. It validates the saved snapshot and selected models,
+reports the benchmark fingerprint, sample and verification-status counts,
+model eligibility, requested and effective controls, and confirms that no
+inference will be sent:
+
+```bash
+uv run vlm-bench run --prepared data/brothers/prepared-test \
+  --models ollama:qwen2.5vl:3b --dry-run
+```
+
+Run each model against that same snapshot, recording the run directory printed
+by each command:
+
+```bash
+uv run vlm-bench run --prepared data/brothers/prepared-test \
+  --models ollama:qwen2.5vl:3b
+
+uv run vlm-bench run --prepared data/brothers/prepared-test \
+  --models trocr:microsoft/trocr-base-handwritten
+```
+
+Use explicit selectors for subscription or API models. `doctor` checks
+provider setup, dependencies, and model availability:
 
 ```bash
 uv run vlm-bench doctor --provider chatgpt \
   --models chatgpt:MODEL_ID_FROM_MODELS
 ```
 
-Use the same seed, limit, split, content type, and preprocessing profile for
-every model. The run manifest freezes the exact sample IDs, references, hashes,
-settings, and model identities. Multiple preprocessing profiles can be
-specified in the TOML file for controlled comparisons. Resume an interrupted
-run with:
+The run manifest records the snapshot fingerprint, frozen sample IDs and
+references, model identities, settings, and available provider usage. Dry-run
+provenance and verification-status counts make it possible to check that each
+model run used the intended benchmark before sending images.
+
+Compare completed runs only when they share the same benchmark fingerprint:
+
+```bash
+uv run vlm-bench compare \
+  --runs runs/RUN_DIRECTORY_FOR_OLLAMA runs/RUN_DIRECTORY_FOR_TROCR \
+  --output comparisons/brothers-test
+```
+
+The output directory must be new. It contains `comparison.json`,
+`comparison.csv`, `paired.csv`, and `costs.csv`. The report includes coverage
+and paired differences. Provider controls can differ; the run manifests record
+what each provider accepted.
+
+Resume an interrupted run from its original directory:
 
 ```bash
 uv run vlm-bench resume --run runs/YOUR_RUN_DIRECTORY
 ```
 
+Resume continues the saved run on its original fingerprint and predictions.
 The optional `--retry-failed` applies only to saved errors; completed
-predictions are retained. Subscription usage pauses are resumable. Remote
-requests and local inference may have different generation controls; recorded
-settings describe what each provider actually accepted.
+predictions are retained. Subscription usage pauses are resumable.
 
-## 5. Configuration and cost assumptions
+For a quick one-off check, the source-data path remains available:
+
+```bash
+uv run vlm-bench run --data data/brothers \
+  --models ollama:qwen2.5vl:3b --layout paired --split test --limit 3 --seed 42 \
+  --dry-run
+```
+
+## 6. Configuration and cost assumptions
 
 Use the versioned example in [`../examples/experiment.toml`](../examples/experiment.toml)
-as a starting point:
+after creating the prepared snapshot it names:
 
 ```bash
 uv run vlm-bench run --config examples/experiment.toml --dry-run
 ```
 
-The config selects the data root, models, split, preprocessing, and seed. It
-can set per-model options such as TrOCR device or beam count. Do not put
-credentials in TOML. The OpenAI API key belongs in the process environment; the
-ChatGPT sign-in token is stored through the credential store.
+Paths in TOML are resolved relative to the TOML file, so the example's
+`prepared` path points to `data/brothers/prepared-test` from the repository
+root. A prepared experiment freezes selection: do not combine `prepared` with
+`data`, `layout`, `preprocess`, `preprocessing`, `limit`, `seed`, `split`, or
+`content_type` in the same experiment table. An explicit CLI `--data` switches
+from a configured prepared snapshot to source data; a CLI `--prepared` selects
+a snapshot instead of configured source data. With `--prepared`, source
+selection flags such as `--split` or `--preprocess` are rejected.
+
+The config can select models, set per-model options such as TrOCR device or
+beam count, and record costs. Provider-inapplicable options are rejected for
+selected models. ChatGPT accepts the shared `num_predict` config field for
+recording, but the subscription adapter reports it as unsupported. Do not put
+credentials in TOML. The OpenAI API key belongs in the process environment;
+the ChatGPT sign-in token is stored through the credential store.
 
 Cost projections are estimates, and the program never invents missing prices.
 Provide local upfront hardware/training cost and operating cost per sample.
@@ -205,7 +266,7 @@ local variable cost is below the API variable cost. Report annotation and
 maintenance hours separately; they are not converted to dollars unless you
 choose and document an hourly rate.
 
-## 6. Read the research reports
+## 7. Read the research reports
 
 The report provides separate prose and equation tracks; IAM word data appears
 as a separate diagnostic. CER and WER use the same verified eligible test

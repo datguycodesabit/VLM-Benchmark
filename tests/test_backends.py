@@ -356,8 +356,9 @@ def test_trocr_uses_local_checkpoint_hash_and_reports_load_duration(tmp_path, mo
 
     class FakeProcessor:
         @classmethod
-        def from_pretrained(cls, location, revision=None):
+        def from_pretrained(cls, location, revision=None, use_fast=None):
             captured["processor"] = (location, revision)
+            captured["processor_use_fast"] = use_fast
             return cls()
 
         def __call__(self, images, return_tensors):
@@ -402,6 +403,7 @@ def test_trocr_uses_local_checkpoint_hash_and_reports_load_duration(tmp_path, mo
     assert identity["checkpoint_sha256"]
     assert identity["device"] == "cpu"
     assert captured["generation"]["num_beams"] == 3
+    assert captured["processor_use_fast"] is False
     assert result["message"]["content"] == "written words"
     assert result["provider_details"]["revision"] == "resolved-commit"
     assert result["load_duration"] > 0

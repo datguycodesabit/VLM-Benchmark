@@ -4,6 +4,9 @@ Notable changes to this project are recorded here.
 
 ## Unreleased
 
+- Add portable, immutable benchmark snapshots and separate-run comparison reports.
+- Record benchmark fingerprints, scoring versions, dependency versions, and effective provider controls.
+- Validate experiment settings before inference and resolve configured paths relative to their TOML file.
 - Add paired image/text folders, dataset audits, document splits, frozen selections, and explicit preprocessing.
 - Add TrOCR, official ChatGPT subscription sign-in, and separate OpenAI API adapters alongside Ollama.
 - Add experiment configurations, dry runs, environment checks, and retries of failed samples.

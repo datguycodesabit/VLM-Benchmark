@@ -257,7 +257,7 @@ class TrOCRBackend(Backend):
         requested_device = identity["device"]
         load_started = time.perf_counter()
         try:
-            processor = TrOCRProcessor.from_pretrained(location, revision=revision)
+            processor = TrOCRProcessor.from_pretrained(location, revision=revision, use_fast=False)
             loaded_model = VisionEncoderDecoderModel.from_pretrained(location, revision=revision)
             try:
                 loaded_model.to(requested_device)
@@ -344,6 +344,7 @@ class TrOCRBackend(Backend):
                     "checkpoint_sha256": self._identities[model].get("checkpoint_sha256"),
                     "generation_seconds": generation_seconds,
                     "num_beams": num_beams,
+                    "processor_use_fast": False,
                     "prompt_supported": False,
                     "unsupported_options": sorted(
                         key

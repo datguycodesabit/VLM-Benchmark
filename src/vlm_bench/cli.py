@@ -7,10 +7,9 @@ import json
 import sys
 from pathlib import Path
 
-from .dataset import prepare_dataset
 from .export import export_run
 from .metrics import score, summarize
-from .runner import _atomic_json, _lock, read_records, resume_benchmark
+from .runner import _lock, read_records, resume_benchmark
 
 
 def parser():
@@ -35,11 +34,12 @@ def parser():
         "--provider", choices=["ollama", "trocr", "chatgpt", "openai"], default="ollama"
     )
     run = sub.add_parser("run", help="Evaluate a frozen dataset or reproducible subset")
-    run.add_argument("--data", type=Path, default=Path("data"))
+    run.add_argument("--data", type=Path)
+    run.add_argument("--prepared", type=Path, help="Use an immutable prepared benchmark")
     run.add_argument("--models", nargs="+")
     run.add_argument("--output", type=Path, default=Path("runs"))
     run.add_argument("--limit", type=int)
-    run.add_argument("--seed", type=int, default=42)
+    run.add_argument("--seed", type=int)
     run.add_argument("--base-url", default="http://localhost:11434")
     run.add_argument("--timeout", type=float, default=300)
     run.add_argument("--num-predict", type=int, default=4096)
@@ -69,7 +69,8 @@ def parser():
     )
     dataset_sub = dataset.add_subparsers(dest="dataset_command", required=True)
     check = dataset_sub.add_parser("check")
-    check.add_argument("--data", type=Path, default=Path("data"))
+    check.add_argument("--data", type=Path)
+    check.add_argument("--prepared", type=Path)
     check.add_argument(
         "--json", action="store_true", help="Print the complete audit, including sample records"
     )
@@ -93,6 +94,9 @@ def parser():
         "rescore", help="Recompute metrics from saved predictions and frozen references"
     )
     rescore.add_argument("--run", type=Path, required=True)
+    compare = sub.add_parser("compare", help="Compare separate runs on the same frozen benchmark")
+    compare.add_argument("--runs", type=Path, nargs="+", required=True)
+    compare.add_argument("--output", type=Path, required=True)
     return root
 
 
@@ -159,7 +163,9 @@ def main(argv=None):
     try:
         if args.command == "prepare":
             output = args.output or args.data / "prepared"
-            samples = prepare_dataset(
+            from .snapshot import freeze
+
+            snapshot = freeze(
                 args.data,
                 output,
                 limit=args.limit,
@@ -170,8 +176,8 @@ def main(argv=None):
                 split=args.split,
                 content_type=args.content_type,
             )
-            _atomic_json(output / "dataset.json", samples)
-            print(f"Prepared {len(samples)} samples in {output.resolve()}")
+            print(f"Prepared {len(snapshot['samples'])} samples in {output.resolve()}")
+            print(f"Benchmark: {snapshot['benchmark_fingerprint']}")
             print("Review the references and saved crops before benchmarking.")
         elif args.command == "auth":
             from . import auth
@@ -180,7 +186,30 @@ def main(argv=None):
         elif args.command == "dataset":
             from .dataset import check_dataset, split_dataset
 
-            report = check_dataset(args.data, layout=args.layout or "auto")
+            if args.dataset_command == "check" and args.prepared is not None:
+                from .snapshot import load
+
+                if args.data is not None or any(
+                    getattr(args, k) is not None
+                    for k in ("layout", "preprocess", "split", "content_type")
+                ):
+                    raise ValueError(
+                        "dataset check --prepared cannot be combined with source-data options"
+                    )
+                snapshot = load(args.prepared)
+                print(
+                    json.dumps(
+                        {
+                            "valid": True,
+                            "manifest_version": snapshot["manifest_version"],
+                            "benchmark_fingerprint": snapshot["benchmark_fingerprint"],
+                            "sample_count": len(snapshot["samples"]),
+                        },
+                        indent=2,
+                    )
+                )
+                return 0
+            report = check_dataset(args.data or Path("data"), layout=args.layout or "auto")
             if args.dataset_command == "check":
                 if args.json:
                     print(json.dumps(report, indent=2, ensure_ascii=False))
@@ -265,37 +294,79 @@ def main(argv=None):
                     else experiment.get(name, current if current is not None else default)
                 )
 
-            options = {
-                "limit": chosen("limit", args.limit, None),
-                "seed": chosen("seed", args.seed, 42),
-                "layout": chosen("layout", args.layout, "auto"),
-                "split": chosen("split", args.split, None),
-                "content_type": chosen("content_type", args.content_type, None),
-                "base_url": args.base_url,
-                "timeout": args.timeout,
-                "settings": config["models"],
-            }
-            data = Path(chosen("data", args.data, Path("data")))
-            profiles = (
-                [args.preprocess]
-                if args.preprocess
-                else experiment.get("preprocessing", [experiment.get("preprocess", "original")])
+            source_keys = (
+                "data",
+                "limit",
+                "seed",
+                "layout",
+                "split",
+                "content_type",
+                "preprocess",
+                "preprocessing",
+            )
+            prepared = args.prepared or experiment.get("prepared")
+            explicit_data = any(a == "--data" or a.startswith("--data=") for a in supplied)
+            if explicit_data and args.prepared is None:
+                prepared = None  # Explicit source input overrides configured snapshot.
+            if prepared is not None:
+                explicit_selection = [
+                    key
+                    for key in source_keys
+                    if any(
+                        a == "--" + key.replace("_", "-")
+                        or a.startswith("--" + key.replace("_", "-") + "=")
+                        for a in supplied
+                    )
+                ]
+                if explicit_selection:
+                    raise ValueError(
+                        "--prepared cannot be combined with " + ", ".join(explicit_selection)
+                    )
+                data = None
+                profiles = [None]
+                selection = {"prepared": Path(prepared)}
+            else:
+                data = Path(chosen("data", args.data, Path("data")))
+                profiles = (
+                    [args.preprocess]
+                    if args.preprocess
+                    else experiment.get("preprocessing", [experiment.get("preprocess", "original")])
+                )
+                selection = {
+                    "limit": chosen("limit", args.limit, None),
+                    "seed": chosen("seed", args.seed, 42),
+                    "layout": chosen("layout", args.layout, "auto"),
+                    "split": chosen("split", args.split, None),
+                    "content_type": chosen("content_type", args.content_type, None),
+                }
+            from .config import validate_settings
+
+            selected_settings = validate_settings(selected, config["models"])
+            if any(a == "--num-predict" or a.startswith("--num-predict=") for a in supplied):
+                selected_settings = {
+                    model: dict(selected_settings.get(model, {}), num_predict=args.num_predict)
+                    for model in selected
+                }
+            options = dict(
+                selection,
+                base_url=args.base_url,
+                timeout=args.timeout,
+                settings=selected_settings,
+                num_predict=args.num_predict,
             )
             failed = False
             for profile in profiles:
-                if profile not in {"original", "enhanced"}:
-                    raise ValueError("Unknown preprocessing profile")
+                if profile is not None:
+                    if profile not in {"original", "enhanced"}:
+                        raise ValueError("Unknown preprocessing profile")
+                    options["preprocess"] = profile
                 if args.dry_run:
-                    print(
-                        json.dumps(preview(data, selected, preprocess=profile, **options), indent=2)
-                    )
+                    print(json.dumps(preview(data, selected, **options), indent=2))
                     continue
                 run_dir = run(
                     data,
                     selected,
                     args.output,
-                    preprocess=profile,
-                    num_predict=args.num_predict,
                     warmup=not args.no_warmup and experiment.get("warmup", True),
                     costs=config["costs"],
                     **options,
@@ -310,6 +381,31 @@ def main(argv=None):
                     json.loads((run_dir / "manifest.json").read_text()).get("status") == "paused"
                 )
             return 2 if failed else 0
+        elif args.command == "compare":
+            from .comparison import compare
+
+            report = compare(args.runs, args.output)
+            for track, result in report["tracks"].items():
+                if not result["eligible_sample_count"]:
+                    continue
+                print(f"{track}: {result['eligible_sample_count']} eligible samples")
+                print(
+                    f"{'Rank':>4} {'Model / run':<56} {'CER':>9} {'WER':>9} "
+                    f"{'Exact':>9} {'p50 sec':>9} {'Coverage':>9} Status"
+                )
+                for row in result["model_results"]:
+                    values = [
+                        "N/A" if row.get(key) is None else f"{row[key]:.2%}"
+                        for key in ("cer", "wer", "exact_match_rate", "sample_coverage")
+                    ]
+                    median = row.get("median_latency_seconds")
+                    latency = "N/A" if median is None else f"{median:.2f}"
+                    rank = row.get("rank") or "—"
+                    print(
+                        f"{rank:>4} {row['model']:<56} {values[0]:>9} {values[1]:>9} "
+                        f"{values[2]:>9} {latency:>9} {values[3]:>9} {row['status']}"
+                    )
+            print(f"Saved comparison: {args.output.resolve()}")
         elif args.command == "resume":
             manifest = json.loads((args.run / "manifest.json").read_text())
             if manifest.get("schema_version", 1) == 2:

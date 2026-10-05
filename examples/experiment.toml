@@ -1,17 +1,11 @@
 version = 1
 
 [experiment]
-data = "data/brothers"
+prepared = "../data/brothers/prepared-test"
 models = [
   "ollama:qwen2.5vl:3b",
   "trocr:microsoft/trocr-base-handwritten",
 ]
-layout = "paired"
-split = "test"
-content_type = "prose"
-preprocess = "original"
-seed = 42
-limit = 100
 warmup = true
 
 [models."trocr:microsoft/trocr-base-handwritten"]

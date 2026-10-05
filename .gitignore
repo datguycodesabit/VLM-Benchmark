@@ -38,3 +38,6 @@ Thumbs.db
 !/data/xml/.gitkeep
 !/data/references/
 !/data/references/.gitkeep
+# Frozen benchmark images and generated comparison reports
+benchmarks/
+comparisons/

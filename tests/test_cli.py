@@ -70,3 +70,120 @@ def test_paired_check_and_configured_dry_run(tmp_path, monkeypatch, capsys):
     assert [item["execution"] for item in report["models"]] == ["local", "cloud"]
     assert Backend.calls == []
     assert not (tmp_path / "runs").exists()
+
+
+def test_prepared_cli_workflow_and_selection_conflicts(tmp_path, monkeypatch, capsys):
+    import json
+
+    from vlm_bench import engine
+
+    data = tmp_path / "data"
+    (data / "images").mkdir(parents=True)
+    (data / "text").mkdir()
+    Image.new("RGB", (90, 25), "white").save(data / "images" / "line.png")
+    (data / "text" / "line.txt").write_text("hello", encoding="utf-8")
+    prepared = tmp_path / "benchmark"
+    assert main(["prepare", "--data", str(data), "--output", str(prepared)]) == 0
+    capsys.readouterr()
+    assert main(["dataset", "check", "--prepared", str(prepared)]) == 0
+    assert json.loads(capsys.readouterr().out)["valid"]
+    assert main(["prepare", "--data", str(data), "--output", str(prepared)]) == 1
+    capsys.readouterr()
+    original_preview = engine.preview
+    monkeypatch.setattr(
+        engine, "preview", lambda *a, **k: original_preview(*a, **k, backend_factory=Backend)
+    )
+    assert main(["run", "--prepared", str(prepared), "--models", "ollama:first", "--dry-run"]) == 0
+    report = json.loads(capsys.readouterr().out)
+    assert report["benchmark_fingerprint"]
+    for flag, value in [
+        ("--seed", "42"),
+        ("--limit", "1"),
+        ("--preprocess", "original"),
+        ("--data", str(data)),
+    ]:
+        assert (
+            main(
+                [
+                    "run",
+                    "--prepared",
+                    str(prepared),
+                    "--models",
+                    "ollama:first",
+                    "--dry-run",
+                    flag,
+                    value,
+                ]
+            )
+            == 1
+        )
+        assert "--prepared cannot" in capsys.readouterr().err
+
+
+def test_separate_runs_compare_and_cli_token_limit_overrides_config(tmp_path, monkeypatch, capsys):
+    import json
+
+    from vlm_bench import engine
+    from vlm_bench.snapshot import freeze
+
+    data = tmp_path / "data"
+    (data / "images").mkdir(parents=True)
+    (data / "text").mkdir()
+    Image.new("RGB", (90, 25), "white").save(data / "images" / "line.png")
+    (data / "text" / "line.txt").write_text("hello", encoding="utf-8")
+    snapshot = tmp_path / "benchmark"
+    freeze(data, snapshot)
+    config = tmp_path / "experiment.toml"
+    config.write_text(
+        'version = 1\n[experiment]\nprepared = "benchmark"\nmodels = ["ollama:first"]\n[models."ollama:first"]\nnum_predict = 77\n',
+        encoding="utf-8",
+    )
+    original_run = engine.run
+    monkeypatch.setattr(
+        engine, "run", lambda *a, **k: original_run(*a, **k, backend_factory=Backend)
+    )
+    Backend.calls = []
+    runs = tmp_path / "runs"
+    assert (
+        main(
+            [
+                "run",
+                "--config",
+                str(config),
+                "--output",
+                str(runs),
+                "--num-predict",
+                "22",
+                "--no-warmup",
+            ]
+        )
+        == 0
+    )
+    first = next(runs.iterdir())
+    manifest = json.loads((first / "manifest.json").read_text())
+    assert manifest["provider_controls"]["ollama:first"]["effective"]["num_predict"] == 22
+    assert (
+        main(
+            [
+                "run",
+                "--prepared",
+                str(snapshot),
+                "--models",
+                "trocr:second",
+                "--output",
+                str(runs),
+                "--no-warmup",
+            ]
+        )
+        == 0
+    )
+    second = next(d for d in runs.iterdir() if d != first)
+    output = tmp_path / "comparison"
+    assert main(["compare", "--runs", str(first), str(second), "--output", str(output)]) == 0
+    report = json.loads((output / "comparison.json").read_text())
+    assert len(report["tracks"]["prose"]["model_results"]) == 2
+    assert all(r["cer"] == 0 for r in report["tracks"]["prose"]["model_results"])
+    assert (output / "comparison.csv").exists()
+    assert (output / "paired.csv").exists()
+    assert main(["compare", "--runs", str(first), str(second), "--output", str(output)]) == 1
+    capsys.readouterr()

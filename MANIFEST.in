@@ -6,6 +6,8 @@ recursive-include docs *.md
 recursive-include examples *.toml
 prune data
 prune runs
+prune benchmarks
+prune comparisons
 prune .venv
 prune .git
 prune .github
