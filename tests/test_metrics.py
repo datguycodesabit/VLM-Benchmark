@@ -124,6 +124,44 @@ def test_summary_uses_corpus_weighting_and_reports_latency_and_warmups():
     assert result["warmup_load_duration_seconds"] == pytest.approx(2.5)
 
 
+def test_summary_scores_cache_hits_but_excludes_them_from_latency_metrics():
+    records = [
+        {
+            "model": "cached-model",
+            "sample_id": "cached",
+            "status": "success",
+            "prediction": "wrong",
+            "reference": "right",
+            "cache_hit": True,
+            "latency_seconds": 99.0,
+            "load_duration_seconds": 50.0,
+        },
+        {
+            "model": "cached-model",
+            "sample_id": "measured",
+            "status": "success",
+            "prediction": "right",
+            "reference": "right",
+            "latency_seconds": 2.0,
+            "load_duration_seconds": 0.25,
+        },
+    ]
+
+    result = summarize(records)[0]
+
+    assert result["cer"] == pytest.approx(score("wrong", "right")["cer"] / 2)
+    assert result["success_count"] == 2
+    assert result["scored_sample_count"] == 2
+    assert result["complete"] is True
+    assert result["cache_hit_count"] == 1
+    assert result["measured_latency_sample_count"] == 1
+    assert result["mean_latency_seconds"] == pytest.approx(2.0)
+    assert result["total_latency_seconds"] == pytest.approx(2.0)
+    assert result["samples_per_minute"] == pytest.approx(30.0)
+    assert result["load_duration_seconds"] == pytest.approx(0.25)
+    assert result["load_event_count"] == 1
+
+
 def test_summary_ranks_only_complete_models_and_checks_expected_coverage():
     records = [
         {

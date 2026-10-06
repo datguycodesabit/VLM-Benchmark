@@ -27,7 +27,11 @@ _SAMPLE_FIELD_ORDER = [
     "word_edits",
     "reference_chars",
     "reference_words",
+    "cache_hit",
+    "cache_bypass_reason",
+    "cache_lookup_seconds",
     "latency_seconds",
+    "inference_latency_seconds",
     "load_duration_seconds",
     "truncated",
     "error",
@@ -47,11 +51,13 @@ _SUMMARY_FIELD_ORDER = [
     "failure_rate",
     "empty_count",
     "truncated_count",
+    "cache_hit_count",
     "cer",
     "wer",
     "mean_sample_cer",
     "mean_sample_wer",
     "exact_match_rate",
+    "measured_latency_sample_count",
     "mean_latency_seconds",
     "median_latency_seconds",
     "p95_latency_seconds",
@@ -247,6 +253,7 @@ def _write_workbook(
     errors: list[dict[str, Any]],
     manifest: dict[str, Any],
     warmup_rows: list[dict[str, Any]],
+    records: list[dict[str, Any]],
 ) -> None:
     try:
         from openpyxl import Workbook
@@ -290,7 +297,7 @@ def _write_workbook(
     if manifest.get("schema_version") == 2:
         from .research import research_reports
 
-        report = research_reports(sample_rows, dict(manifest, warmups=warmup_rows or []))
+        report = research_reports(records, dict(manifest, warmups=warmup_rows or []))
         tracks, pairs, costs = _research_tables(report)
         for title, rows in (
             ("Task Results", tracks),
@@ -298,6 +305,9 @@ def _write_workbook(
             ("Cost Scenarios", costs),
         ):
             tables.append((title, rows, _table_columns(rows)))
+        task_metric_rows = _task_metrics_rows(report)
+        if task_metric_rows:
+            tables.append(("Task Metrics", task_metric_rows, _table_columns(task_metric_rows)))
     for title, rows, columns in tables:
         worksheet = workbook.create_sheet(title)
         _append_table(worksheet, title, columns, rows, overflow_rows)
@@ -354,6 +364,65 @@ def _research_tables(report):
     cost_report = report.get("cost_scenarios", {})
     costs = cost_report.get("scenarios", []) if isinstance(cost_report, dict) else cost_report
     return tracks, pairs, costs
+
+
+def _flatten_task_metric(value: Any, prefix: str = "") -> dict[str, Any]:
+    if isinstance(value, dict):
+        flattened: dict[str, Any] = {}
+        for key, child in sorted(value.items(), key=lambda item: str(item[0])):
+            name = f"{prefix}.{key}" if prefix else str(key)
+            flattened.update(_flatten_task_metric(child, name))
+        return flattened
+    if isinstance(value, (list, tuple)):
+        return {prefix: json.dumps(value, ensure_ascii=False, sort_keys=True)}
+    return {prefix: value}
+
+
+def _task_metrics_rows(report: dict[str, Any]) -> list[dict[str, Any]]:
+    task_metrics = report.get("task_metrics")
+    if not isinstance(task_metrics, dict):
+        return []
+    base = {key: value for key, value in task_metrics.items() if key != "tracks"}
+    tracks = task_metrics.get("tracks")
+    if not isinstance(tracks, dict):
+        return [_flatten_task_metric(base)] if base else []
+    rows = []
+    for track, track_report in sorted(tracks.items()):
+        if not isinstance(track_report, dict):
+            continue
+        shared = {key: value for key, value in track_report.items() if key != "models"}
+        models = track_report.get("models", [])
+        if isinstance(models, dict):
+            models = [{"model": model, **values} for model, values in models.items()]
+        if not isinstance(models, list) or not models:
+            rows.append(_flatten_task_metric({**base, "track": track, **shared}))
+            continue
+        for model_report in models:
+            if isinstance(model_report, dict):
+                rows.append(
+                    _flatten_task_metric({**base, "track": track, **shared, **model_report})
+                )
+    return rows
+
+
+def _attach_evaluation_metadata(report: dict[str, Any], manifest: dict[str, Any]) -> None:
+    """Include run eligibility context without replacing scorer-owned fields."""
+    evaluation = report.setdefault("evaluation", {})
+    if not isinstance(evaluation, dict):
+        raise ValueError("research report evaluation metadata must be an object")
+    for key in (
+        "strict_research",
+        "protocol",
+        "research_protocol_version",
+        "research",
+        "source_audit",
+        "validation_scope",
+        "research_validation_boundary",
+        "formula_rendering",
+        "task_metrics_version",
+    ):
+        if key in manifest:
+            evaluation.setdefault(key, manifest[key])
 
 
 def export_run(run_dir: Path, formats: list[str]) -> list[Path]:
@@ -414,6 +483,8 @@ def export_run(run_dir: Path, formats: list[str]) -> list[Path]:
         from .research import research_reports
 
         report = research_reports(records, dict(manifest, warmups=warmups))
+        _attach_evaluation_metadata(report, manifest)
+        task_metric_rows = _task_metrics_rows(report)
         research_path = run_dir / "research.json"
         research_path.write_text(json.dumps(report, indent=2, ensure_ascii=False), encoding="utf-8")
         outputs.append(research_path)
@@ -423,13 +494,25 @@ def export_run(run_dir: Path, formats: list[str]) -> list[Path]:
                 path = run_dir / f"{name}.csv"
                 _write_csv(path, values, _table_columns(values))
                 outputs.append(path)
+            if task_metric_rows:
+                path = run_dir / "task_metrics.csv"
+                _write_csv(path, task_metric_rows, _table_columns(task_metric_rows))
+                outputs.append(path)
         # Mixed-task aggregate accuracy is descriptive, not a research ranking.
         for row in summary_rows:
             row["rank"] = None
 
     if "xlsx" in normalized_formats:
         workbook_path = run_dir / "results.xlsx"
-        _write_workbook(workbook_path, summary_rows, sample_rows, error_rows, manifest, warmups)
+        _write_workbook(
+            workbook_path,
+            summary_rows,
+            sample_rows,
+            error_rows,
+            manifest,
+            warmups,
+            records,
+        )
         outputs.append(workbook_path)
     if "csv" in normalized_formats:
         summary_path = run_dir / "summary.csv"

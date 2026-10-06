@@ -15,6 +15,8 @@ import mimetypes
 import os
 import re
 import time
+from datetime import UTC, datetime
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -22,6 +24,7 @@ from urllib.parse import urlsplit
 import httpx
 
 from . import auth
+from .execution import RetryableProviderError
 from .ollama import OllamaClient
 
 DEFAULT_TROCR_MODEL = "microsoft/trocr-base-handwritten"
@@ -76,21 +79,37 @@ class Backend:
     ) -> dict[str, Any]:
         raise NotImplementedError
 
+    def transcribe_once(
+        self,
+        model: str,
+        image_path: Path,
+        prompt: str,
+        options: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Perform one generation request; managed retries belong to engine."""
+        return self.transcribe(model, image_path, prompt, options)
+
     def unload(self, model: str) -> None:
         """Release a model after its benchmark run when possible."""
 
 
 def parse_model(selector: str) -> tuple[str, str]:
-    """Return ``(provider, model_id)``; bare model IDs remain Ollama IDs."""
+    """Return ``(provider, model_id)``; bare IDs remain Ollama IDs.
+
+    ``external:<system>`` is a selector for imported predictions only. It is
+    intentionally not a backend provider and cannot be passed to
+    :func:`create_backend`.
+    """
     if not isinstance(selector, str) or not selector.strip():
         raise ValueError("Model selector cannot be empty")
     selector = selector.strip()
     provider, separator, model = selector.partition(":")
-    if separator and provider.lower() in _PROVIDERS:
+    provider = provider.lower()
+    if separator and provider in _PROVIDERS | {"external"}:
         model = model.strip()
         if not model:
             raise ValueError(f"Model selector {selector!r} has no model ID")
-        return provider.lower(), model
+        return provider, model
     return "ollama", selector
 
 
@@ -480,6 +499,29 @@ class _ResponsesBackend(Backend):
         }
 
     def transcribe(self, model, image_path, prompt, options):
+        return self._transcribe(model, image_path, prompt, options, managed=False)
+
+    def transcribe_once(self, model, image_path, prompt, options):
+        return self._transcribe(model, image_path, prompt, options, managed=True)
+
+    @staticmethod
+    def _retry_after(response: httpx.Response) -> float | None:
+        value = response.headers.get("Retry-After")
+        if value is None:
+            return None
+        try:
+            delay = float(value)
+        except ValueError:
+            try:
+                retry_at = parsedate_to_datetime(value)
+                if retry_at.tzinfo is None:
+                    retry_at = retry_at.replace(tzinfo=UTC)
+                delay = (retry_at - datetime.now(UTC)).total_seconds()
+            except (TypeError, ValueError, OverflowError):
+                return None
+        return max(0.0, delay)
+
+    def _transcribe(self, model, image_path, prompt, options, *, managed):
         try:
             image = Path(image_path).read_bytes()
         except OSError as exc:
@@ -549,7 +591,8 @@ class _ResponsesBackend(Backend):
         # Only retry failures raised while establishing the connection. Once a
         # response begins, a dropped stream may represent a completed billable
         # request, so the adapter never replays it.
-        for attempt in range(3):
+        max_attempts = 1 if managed else 3
+        for attempt in range(max_attempts):
             output_parts.clear()
             completed_data = None
             try:
@@ -563,12 +606,25 @@ class _ResponsesBackend(Backend):
                             "subscription_sharing_usage_unavailable",
                         }:
                             raise BackendPaused(self.provider, model, error_code)
-                        if response.status_code == 429 and attempt < 2:
-                            try:
-                                retry_delay = float(response.headers.get("Retry-After", "0.5"))
-                            except ValueError:
-                                retry_delay = 0.5
-                            raise _RetryableStatus(max(0.1, min(retry_delay, 3.0)))
+                        if response.status_code == 429:
+                            delay = self._retry_after(response)
+                            if managed:
+                                raise RetryableProviderError(
+                                    f"{self.provider} rate limit exceeded",
+                                    retry_after_seconds=delay,
+                                    category="rate_limited",
+                                )
+                            if attempt < 2:
+                                raise _RetryableStatus(
+                                    max(0.1, min(delay if delay is not None else 0.5, 3.0))
+                                )
+                        if response.status_code in {500, 502, 503, 504}:
+                            if managed:
+                                raise RetryableProviderError(
+                                    f"{self.provider} temporary HTTP {response.status_code}",
+                                    retry_after_seconds=self._retry_after(response),
+                                    category=f"http_{response.status_code}",
+                                )
                         raise RuntimeError(f"{self.provider} response failed: {error_code}")
                     for line in response.iter_lines():
                         if not line.startswith("data:"):
@@ -621,6 +677,11 @@ class _ResponsesBackend(Backend):
                 retry_count += 1
                 time.sleep(retry.delay)
             except (httpx.ConnectError, httpx.ConnectTimeout):
+                if managed:
+                    raise RetryableProviderError(
+                        f"{self.provider} connection failed before response",
+                        category="connection_error",
+                    ) from None
                 if attempt >= 2:
                     raise RuntimeError(
                         f"{self.provider} could not connect after {attempt + 1} attempts"

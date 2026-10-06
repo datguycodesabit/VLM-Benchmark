@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import csv
+import hashlib
 import json
 from pathlib import Path
 
@@ -64,6 +65,14 @@ def test_export_run_writes_summary_csv_samples_csv_and_xlsx_without_mutating_jso
             "error": "=TIMEOUT()",
         },
     ]
+    records[0].update(
+        cache_hit=True,
+        cache_bypass_reason=None,
+        cache_lookup_seconds=0.003,
+        latency_seconds=None,
+        inference_latency_seconds=None,
+    )
+    records[1].update(cache_hit=False, cache_bypass_reason="cache_disabled")
     warmups = [
         {
             "model": formula_text,
@@ -101,17 +110,29 @@ def test_export_run_writes_summary_csv_samples_csv_and_xlsx_without_mutating_jso
     assert samples["broken"]["prediction"] == ""
     assert samples["broken"]["error"] == "'=TIMEOUT()"
     assert samples["'=1+1"]["cer"] == "0.0"
+    assert samples["'=1+1"]["cache_hit"] == "true"
+    assert samples["'=1+1"]["cache_bypass_reason"] == ""
+    assert samples["'=1+1"]["cache_lookup_seconds"] == "0.003"
+    assert samples["broken"]["cache_bypass_reason"] == "cache_disabled"
 
     with (tmp_path / "summary.csv").open(encoding="utf-8-sig", newline="") as file:
         summaries = {row["model"]: row for row in csv.DictReader(file)}
     assert summaries["'=1+1"]["complete"] == "true"
     assert summaries["'=1+1"]["warmup_count"] == "1"
     assert summaries["'=1+1"]["warmup_load_duration_seconds"] == "1.5"
+    assert summaries["'=1+1"]["cache_hit_count"] == "1"
+    assert summaries["'=1+1"]["measured_latency_sample_count"] == "0"
     assert summaries["broken"]["complete"] == "false"
     assert summaries["broken"]["failure_rate"] == "1.0"
+    assert summaries["broken"]["cache_hit_count"] == "0"
+    assert summaries["broken"]["measured_latency_sample_count"] == "1"
 
     workbook = load_workbook(tmp_path / "results.xlsx", data_only=False)
     assert workbook.sheetnames == ["Summary", "Samples", "Errors", "Run Configuration", "Warmups"]
+    summary_headers = {cell.value for cell in workbook["Summary"][1]}
+    assert {"cache_hit_count", "measured_latency_sample_count"}.issubset(summary_headers)
+    sample_headers = {cell.value for cell in workbook["Samples"][1]}
+    assert {"cache_hit", "cache_bypass_reason"}.issubset(sample_headers)
     assert not [
         cell
         for sheet in workbook.worksheets
@@ -230,3 +251,84 @@ def test_interrupted_run_and_missing_manifest_samples_are_not_ranked(tmp_path):
     assert summary["rank"] == ""
     assert summary["expected_sample_count"] == "2"
     assert summary["missing_sample_count"] == "1"
+
+
+def test_research_export_includes_evaluation_protocol(tmp_path):
+    record = _success_record("vision", "one", "same", "same")
+    manifest = {
+        "schema_version": 2,
+        "status": "complete",
+        "models": ["vision"],
+        "samples": [
+            {
+                "id": "one",
+                "reference": "same",
+                "split": "test",
+                "source_document": "doc-a",
+                "verification_status": "verified",
+            }
+        ],
+        "strict_research": True,
+        "protocol": "writer-disjoint",
+        "research_protocol_version": 1,
+    }
+    _write_run(tmp_path, [record], manifest)
+
+    export_run(tmp_path, ["jsonl"])
+
+    report = json.loads((tmp_path / "research.json").read_text(encoding="utf-8"))
+    assert report["evaluation"] == {
+        "strict_research": True,
+        "protocol": "writer-disjoint",
+        "research_protocol_version": 1,
+    }
+
+
+def test_schema_two_export_adds_unranked_task_metrics_sheet_and_csv(tmp_path):
+    from vlm_bench.task_metrics import score_task
+
+    sample = {
+        "id": "equation-1",
+        "reference": "x = 1",
+        "hashes": {"crop": hashlib.sha256(b"crop").hexdigest()},
+        "preprocess": "original",
+        "content_type": "equation",
+        "split": "test",
+        "verified": True,
+        "source_document": "doc-1",
+        "metadata": {
+            "annotations": {
+                "critical_expressions": ["x"],
+                "reading_order": [],
+            }
+        },
+    }
+    record = _success_record("vision", sample["id"], "x = 1", sample["reference"])
+    record["metrics"]["task_metrics"] = score_task(
+        record["prediction"], sample["reference"], sample
+    )
+    _write_run(
+        tmp_path,
+        [record],
+        {
+            "schema_version": 2,
+            "status": "complete",
+            "models": ["vision"],
+            "samples": [sample],
+            "preprocess": "original",
+            "formula_rendering": False,
+            "task_metrics_version": 1,
+        },
+    )
+
+    outputs = export_run(tmp_path, ["xlsx", "csv"])
+    report = json.loads((tmp_path / "research.json").read_text(encoding="utf-8"))
+    assert report["task_metrics"]["ranking"] is None
+    assert tmp_path / "task_metrics.csv" in outputs
+    with (tmp_path / "task_metrics.csv").open(encoding="utf-8-sig", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    assert any(row["track"] == "equation" for row in rows)
+
+    workbook = load_workbook(tmp_path / "results.xlsx", data_only=True)
+    assert "Task Metrics" in workbook.sheetnames
+    assert "track" in {cell.value for cell in workbook["Task Metrics"][1]}

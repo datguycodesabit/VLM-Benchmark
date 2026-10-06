@@ -34,13 +34,15 @@ def _completed(text="written words", usage=None):
         ("trocr:microsoft/trocr-base-handwritten", ("trocr", "microsoft/trocr-base-handwritten")),
         ("chatgpt:gpt-6.1-sol", ("chatgpt", "gpt-6.1-sol")),
         ("openai:gpt-6.1-sol", ("openai", "gpt-6.1-sol")),
+        ("external:tesseract", ("external", "tesseract")),
+        ("EXTERNAL:My OCR", ("external", "My OCR")),
     ],
 )
 def test_parse_provider_selector(selector, expected):
     assert parse_model(selector) == expected
 
 
-@pytest.mark.parametrize("selector", ["", "   ", "trocr:", "chatgpt: "])
+@pytest.mark.parametrize("selector", ["", "   ", "trocr:", "chatgpt: ", "external: "])
 def test_parse_model_rejects_empty_selector(selector):
     with pytest.raises(ValueError):
         parse_model(selector)
@@ -49,6 +51,8 @@ def test_parse_model_rejects_empty_selector(selector):
 def test_factory_rejects_unknown_provider():
     with pytest.raises(ValueError, match="Unknown backend"):
         create_backend("made-up")
+    with pytest.raises(ValueError, match="Unknown backend"):
+        create_backend("external")
 
 
 def test_ollama_adapter_keeps_legacy_response_and_sanitizes_identity():
@@ -255,6 +259,50 @@ def test_retry_after_on_rejected_rate_limit_is_bounded_and_counted(tmp_path, mon
         result = backend.transcribe("model", image, "read", {})
     assert len(calls) == 2
     assert result["provider_details"]["retry_count"] == 1
+
+
+def test_managed_cloud_request_surfaces_safe_retry_without_nested_replay(tmp_path, monkeypatch):
+    from vlm_bench.execution import RetryableProviderError
+
+    image = tmp_path / "line.png"
+    image.write_bytes(b"image")
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        raise httpx.ConnectError("private details", request=request)
+
+    monkeypatch.setattr("vlm_bench.backends.auth.get_access_token", lambda client_id: "temporary")
+    with create_backend("chatgpt", settings={"transport": httpx.MockTransport(handler)}) as backend:
+        with pytest.raises(RetryableProviderError, match="connection failed"):
+            backend.transcribe_once("model", image, "read", {})
+
+    assert len(calls) == 1
+
+
+def test_managed_cloud_rate_limit_preserves_retry_after_for_engine(tmp_path, monkeypatch):
+    from vlm_bench.execution import RetryableProviderError
+
+    image = tmp_path / "line.png"
+    image.write_bytes(b"image")
+    calls = []
+
+    def handler(request):
+        calls.append(request)
+        return httpx.Response(
+            429,
+            headers={"Retry-After": "0.25"},
+            json={"error": {"code": "rate_limit_exceeded"}},
+        )
+
+    monkeypatch.setattr("vlm_bench.backends.auth.get_access_token", lambda client_id: "temporary")
+    with create_backend("chatgpt", settings={"transport": httpx.MockTransport(handler)}) as backend:
+        with pytest.raises(RetryableProviderError) as caught:
+            backend.transcribe_once("model", image, "read", {})
+
+    assert len(calls) == 1
+    assert caught.value.retry_after_seconds == pytest.approx(0.25)
+    assert caught.value.category == "rate_limited"
 
 
 def test_subscription_http_quota_limit_pauses_without_retry(tmp_path, monkeypatch):

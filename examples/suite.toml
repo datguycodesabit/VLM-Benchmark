@@ -1,0 +1,27 @@
+# Version 2 defines named conditions over frozen prepared snapshots.
+# Create the snapshot referenced below before previewing or running this suite.
+version = 2
+
+[experiment]
+prepared = "../data/brothers/prepared-test"
+warmup = false
+strict_research = true
+protocol = "document-disjoint"
+
+[models."ollama:qwen2.5vl:3b"]
+temperature = 0.0
+
+[suite]
+repeats = 2
+
+[[suite.conditions]]
+name = "baseline-prompt"
+models = ["ollama:qwen2.5vl:3b"]
+prose_prompt = "Transcribe the handwritten text exactly. Preserve spelling and punctuation."
+math_prompt = "Transcribe every mathematical symbol exactly. Preserve the equation notation."
+
+[[suite.conditions]]
+name = "layout-aware-prompt"
+models = ["ollama:qwen2.5vl:3b"]
+prose_prompt = "Read the line from left to right. Return only its exact transcription."
+math_prompt = "Read the equation from left to right. Return only its exact symbols and notation."

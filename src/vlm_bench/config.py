@@ -22,6 +22,14 @@ _EXPERIMENT_FIELDS = {
     "content_type",
     "warmup",
     "preprocessing",
+    "strict_research",
+    "protocol",
+    "formula_rendering",
+    "max_retries",
+    "concurrency",
+    "max_requests",
+    "max_spend_usd",
+    "cache_dir",
 }
 _SELECTION_FIELDS = {
     "data",
@@ -38,6 +46,8 @@ _MODEL_SETTINGS = {
     "revision",
     "num_predict",
     "num_beams",
+    "temperature",
+    "seed",
     "reasoning_effort",
     "image_detail",
 }
@@ -46,6 +56,7 @@ _SPLITS = {"train", "validation", "test"}
 _LAYOUTS = {"auto", "paired", "iam-words", "iam-lines", "iam-forms"}
 _PROFILES = {"original", "enhanced"}
 _CONTENT_TYPES = {"prose", "equation", "word"}
+_PROTOCOLS = {"document-disjoint", "writer-disjoint"}
 _MAX_SEED = 2**32 - 1
 
 
@@ -104,6 +115,25 @@ def _validate_model_settings(settings: Any, context: str) -> dict[str, Any]:
         _positive_integer(result["num_predict"], f"num_predict for {context}")
     if "num_beams" in result:
         _positive_integer(result["num_beams"], f"num_beams for {context}", maximum=10)
+    if "temperature" in result:
+        temperature = result["temperature"]
+        try:
+            finite_temperature = math.isfinite(temperature)
+        except (TypeError, OverflowError):
+            finite_temperature = False
+        if (
+            isinstance(temperature, bool)
+            or not isinstance(temperature, (int, float))
+            or not finite_temperature
+            or not 0 <= temperature <= 2
+        ):
+            raise ValueError(f"temperature for {context} must be finite and between 0 and 2")
+    if "seed" in result and (
+        isinstance(result["seed"], bool)
+        or not isinstance(result["seed"], int)
+        or not 0 <= result["seed"] <= _MAX_SEED
+    ):
+        raise ValueError(f"seed for {context} must be an integer from 0 to {_MAX_SEED}")
     if "image_detail" in result and (
         not isinstance(result["image_detail"], str)
         or result["image_detail"] not in {"auto", "low", "high"}
@@ -145,10 +175,23 @@ def validate_settings(
             continue
         provider, _ = _selector(selector, "model settings")
         canonical_options = _validate_model_settings(options, str(selector))
+        if provider == "external" and canonical_options:
+            raise ValueError("Settings are not supported for provider 'external'")
         if provider == "trocr":
-            inapplicable = set(canonical_options) & {"reasoning_effort", "image_detail"}
+            inapplicable = set(canonical_options) & {
+                "reasoning_effort",
+                "image_detail",
+                "temperature",
+                "seed",
+            }
         elif provider in {"openai", "chatgpt"}:
-            inapplicable = set(canonical_options) & {"device", "revision", "num_beams"}
+            inapplicable = set(canonical_options) & {
+                "device",
+                "revision",
+                "num_beams",
+                "temperature",
+                "seed",
+            }
         else:
             inapplicable = set(canonical_options) & {
                 "device",
@@ -194,6 +237,8 @@ def _validate_experiment(experiment: Any, base: Path) -> dict[str, Any]:
                 + ", ".join(sorted(conflicts))
             )
         result["prepared"] = _path_from_config(result["prepared"], "prepared", base)
+    if "cache_dir" in result:
+        result["cache_dir"] = _path_from_config(result["cache_dir"], "cache_dir", base)
     if "data" in result:
         result["data"] = _path_from_config(result["data"], "data", base)
     if "models" in result:
@@ -233,6 +278,33 @@ def _validate_experiment(experiment: Any, base: Path) -> dict[str, Any]:
         raise ValueError("experiment.content_type must be prose, equation, or word")
     if "warmup" in result and not isinstance(result["warmup"], bool):
         raise ValueError("experiment.warmup must be a boolean")
+    if "strict_research" in result and not isinstance(result["strict_research"], bool):
+        raise ValueError("experiment.strict_research must be a boolean")
+    if "formula_rendering" in result and not isinstance(result["formula_rendering"], bool):
+        raise ValueError("experiment.formula_rendering must be a boolean")
+    if "protocol" in result and (
+        not isinstance(result["protocol"], str) or result["protocol"] not in _PROTOCOLS
+    ):
+        raise ValueError("experiment.protocol must be document-disjoint or writer-disjoint")
+    if "max_retries" in result and (
+        isinstance(result["max_retries"], bool)
+        or not isinstance(result["max_retries"], int)
+        or result["max_retries"] < 0
+    ):
+        raise ValueError("experiment.max_retries must be a non-negative integer")
+    if "concurrency" in result:
+        _positive_integer(result["concurrency"], "experiment.concurrency")
+    if "max_requests" in result:
+        _positive_integer(result["max_requests"], "experiment.max_requests")
+    if "max_spend_usd" in result:
+        amount = result["max_spend_usd"]
+        if (
+            isinstance(amount, bool)
+            or not isinstance(amount, (int, float))
+            or not math.isfinite(amount)
+            or amount <= 0
+        ):
+            raise ValueError("experiment.max_spend_usd must be a positive finite number")
     return result
 
 
@@ -287,8 +359,174 @@ def _validate_costs(costs: Any) -> dict[str, Any]:
     return result
 
 
+def _optional_prompt(condition: Mapping[str, Any], name: str) -> str | None:
+    if name not in condition:
+        return None
+    value = condition[name]
+    if not isinstance(value, str) or not value.strip():
+        raise ValueError(f"suite condition {name} must be a non-empty string")
+    return value
+
+
+def _validate_suite_settings(settings: Any, models: Sequence[str], context: str) -> None:
+    if not isinstance(settings, Mapping):
+        raise ValueError(f"{context} must be a table keyed by selected model selector")
+    selected = {f"{provider}:{model}" for provider, model in _selector_list(models, "models")}
+    seen: set[str] = set()
+    for selector in settings:
+        canonical = _canonical_selector(selector, context)
+        if canonical in seen:
+            raise ValueError(f"Duplicate settings for {context} selector {selector!r}")
+        seen.add(canonical)
+        if canonical not in selected:
+            raise ValueError(f"{context} contains settings for unselected model {selector!r}")
+
+
+def _validate_suite(
+    suite: Any,
+    experiment: Mapping[str, Any],
+    global_settings: Mapping[str, Any],
+    base: Path,
+) -> dict[str, Any]:
+    if not isinstance(suite, Mapping):
+        raise ValueError("version = 2 requires a [suite] table")
+    unknown = set(suite) - {"repeats", "conditions"}
+    if unknown:
+        raise ValueError("Unknown suite option: " + ", ".join(sorted(unknown)))
+
+    source_options = {
+        "data",
+        "limit",
+        "seed",
+        "layout",
+        "preprocess",
+        "preprocessing",
+        "split",
+        "content_type",
+    }
+    conflicts = set(experiment) & source_options
+    if conflicts:
+        raise ValueError(
+            "Experiment suites require frozen prepared snapshots and cannot use source selection: "
+            + ", ".join(sorted(conflicts))
+        )
+    if "models" in experiment:
+        raise ValueError(
+            "Each suite condition must define its own models; remove experiment.models"
+        )
+
+    suite_repeats = suite.get("repeats", 1)
+    _positive_integer(suite_repeats, "suite.repeats")
+    conditions = suite.get("conditions")
+    if not isinstance(conditions, list) or not conditions:
+        raise ValueError("suite.conditions must be a non-empty list of conditions")
+
+    condition_fields = {
+        "name",
+        "models",
+        "prepared",
+        "repeats",
+        "prose_prompt",
+        "math_prompt",
+        "settings",
+        "warmup",
+        "strict_research",
+        "protocol",
+        "formula_rendering",
+    }
+    names: set[str] = set()
+    validated_conditions = []
+    for index, raw_condition in enumerate(conditions):
+        context = f"suite.conditions[{index}]"
+        if not isinstance(raw_condition, Mapping):
+            raise ValueError(f"{context} must be a table")
+        unknown = set(raw_condition) - condition_fields
+        if unknown:
+            invalid_selection = unknown & source_options
+            if invalid_selection:
+                raise ValueError(
+                    f"{context} must use a separate prepared snapshot; cannot set: "
+                    + ", ".join(sorted(invalid_selection))
+                )
+            raise ValueError(f"Unknown {context} option: " + ", ".join(sorted(unknown)))
+
+        name = raw_condition.get("name")
+        if not isinstance(name, str) or not name.strip() or name != name.strip():
+            raise ValueError(f"{context}.name must be a non-empty trimmed string")
+        if name in names:
+            raise ValueError(f"suite condition names must be unique: {name!r}")
+        names.add(name)
+
+        models = raw_condition.get("models")
+        parsed_models = _selector_list(models, f"{context}.models")
+        external = [model for provider, model in parsed_models if provider == "external"]
+        if external:
+            raise ValueError(
+                f"{context}.models cannot include external prediction selectors; "
+                "external systems are import-only"
+            )
+
+        configured_prepared = raw_condition.get("prepared", experiment.get("prepared"))
+        if configured_prepared is None:
+            raise ValueError(f"{context}.prepared or experiment.prepared is required")
+        if "prepared" in raw_condition:
+            prepared = _path_from_config(configured_prepared, f"{context}.prepared", base)
+        else:
+            prepared = configured_prepared
+
+        repeats = raw_condition.get("repeats", suite_repeats)
+        _positive_integer(repeats, f"{context}.repeats")
+
+        condition_settings = raw_condition.get("settings", {})
+        _validate_suite_settings(condition_settings, models, f"{context}.settings")
+        global_selected = validate_settings(models, global_settings)
+        local_selected = validate_settings(models, condition_settings)
+        merged_settings = {}
+        for model in models:
+            merged = dict(global_selected.get(model, {}))
+            merged.update(local_selected.get(model, {}))
+            if merged:
+                merged_settings[model] = merged
+        validated_settings = validate_settings(models, merged_settings)
+
+        warmup = raw_condition.get("warmup", experiment.get("warmup", True))
+        strict_research = raw_condition.get(
+            "strict_research", experiment.get("strict_research", False)
+        )
+        protocol = raw_condition.get("protocol", experiment.get("protocol", "document-disjoint"))
+        formula_rendering = raw_condition.get(
+            "formula_rendering", experiment.get("formula_rendering", False)
+        )
+        if not isinstance(warmup, bool):
+            raise ValueError(f"{context}.warmup must be a boolean")
+        if not isinstance(strict_research, bool):
+            raise ValueError(f"{context}.strict_research must be a boolean")
+        if not isinstance(protocol, str) or protocol not in _PROTOCOLS:
+            raise ValueError(f"{context}.protocol must be document-disjoint or writer-disjoint")
+        if not isinstance(formula_rendering, bool):
+            raise ValueError(f"{context}.formula_rendering must be a boolean")
+
+        validated_conditions.append(
+            {
+                "name": name,
+                "models": list(models),
+                "prepared": prepared,
+                "repeats": repeats,
+                "settings": validated_settings,
+                "prose_prompt": _optional_prompt(raw_condition, "prose_prompt"),
+                "math_prompt": _optional_prompt(raw_condition, "math_prompt"),
+                "warmup": warmup,
+                "strict_research": strict_research,
+                "protocol": protocol,
+                "formula_rendering": formula_rendering,
+            }
+        )
+
+    return {"version": 2, "repeats": suite_repeats, "conditions": validated_conditions}
+
+
 def load_config(path: Path | None) -> dict[str, Any]:
-    """Load and validate a version-1 experiment TOML file.
+    """Load and validate a versioned experiment TOML file.
 
     Data and prepared snapshot paths in TOML are resolved against the TOML
     file's directory, making the configuration portable as a project file.
@@ -301,10 +539,14 @@ def load_config(path: Path | None) -> dict[str, Any]:
     if (
         not isinstance(value.get("version"), int)
         or isinstance(value.get("version"), bool)
-        or value["version"] != 1
+        or value["version"] not in {1, 2}
     ):
-        raise ValueError("Experiment config requires version = 1")
-    if set(value) - {"version", "experiment", "models", "costs"}:
+        raise ValueError("Experiment config requires version = 1 or 2")
+    config_version = value["version"]
+    allowed_sections = {"version", "experiment", "models", "costs"}
+    if config_version == 2:
+        allowed_sections.add("suite")
+    if set(value) - allowed_sections:
         raise ValueError("Unknown experiment config section")
 
     base = path.resolve().parent
@@ -319,7 +561,19 @@ def load_config(path: Path | None) -> dict[str, Any]:
         if canonical in canonical_model_keys:
             raise ValueError(f"Duplicate model settings after provider resolution: {selector!r}")
         canonical_model_keys.add(canonical)
-        validated_models[str(selector)] = _validate_model_settings(options, str(selector))
+        provider, _ = _selector(selector, "models")
+        validated_options = _validate_model_settings(options, str(selector))
+        if provider == "external" and validated_options:
+            raise ValueError("Settings are not supported for provider 'external'")
+        validated_models[str(selector)] = validated_options
 
     costs = _validate_costs(value.get("costs", {}))
-    return {"version": 1, "experiment": experiment, "models": validated_models, "costs": costs}
+    result = {
+        "version": config_version,
+        "experiment": experiment,
+        "models": validated_models,
+        "costs": costs,
+    }
+    if config_version == 2:
+        result["suite"] = _validate_suite(value.get("suite"), experiment, validated_models, base)
+    return result

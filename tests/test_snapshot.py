@@ -100,6 +100,29 @@ def test_snapshot_moves_and_runs_without_original_dataset(tmp_path: Path) -> Non
     assert (run_dir / ".lock").read_text(encoding="utf-8") == "held"
 
 
+def test_task_annotations_survive_freeze_load_copy_and_affect_fingerprint(tmp_path: Path) -> None:
+    data = _paired_data(tmp_path)
+    metadata_path = data / "metadata.jsonl"
+    metadata = json.loads(metadata_path.read_text(encoding="utf-8"))
+    metadata["annotations"] = {
+        "critical_expressions": [r"x^2"],
+        "reading_order": [[r"x^2", r"= 0"]],
+    }
+    metadata_path.write_text(json.dumps(metadata) + "\n", encoding="utf-8")
+
+    snapshot_path = tmp_path / "snapshot"
+    frozen = freeze(data, snapshot_path)
+    annotations = frozen["samples"][0]["metadata"]["annotations"]
+    changed_annotation = dict(frozen["samples"][0])
+    changed_annotation["metadata"] = dict(changed_annotation["metadata"])
+    changed_annotation["metadata"]["annotations"] = {"critical_expressions": [r"x^3"]}
+    assert fingerprint([changed_annotation], "original") != frozen["benchmark_fingerprint"]
+    assert load(snapshot_path)["samples"][0]["metadata"]["annotations"] == annotations
+
+    copied_samples, _ = copy_inputs(snapshot_path, tmp_path / "run")
+    assert copied_samples[0]["metadata"]["annotations"] == annotations
+
+
 def test_freeze_refuses_to_overwrite_any_existing_output(tmp_path: Path) -> None:
     data = _paired_data(tmp_path)
     output = tmp_path / "snapshot"

@@ -232,9 +232,14 @@ def summarize(
     for model, model_records in grouped.items():
         metric_rows: list[dict[str, Any]] = []
         success_count = failed_count = empty_count = truncated_count = 0
+        cache_hit_count = 0
+        measured_latency_sample_count = 0
         latencies: list[float] = []
         load_durations: list[float] = []
         for record in model_records:
+            cache_hit = record.get("cache_hit") is True
+            if cache_hit:
+                cache_hit_count += 1
             if record.get("status") == "success":
                 success_count += 1
                 prediction = record.get("prediction", "")
@@ -250,12 +255,14 @@ def summarize(
 
             if record.get("truncated"):
                 truncated_count += 1
-            latency = _number(record.get("latency_seconds"))
-            if latency is not None:
-                latencies.append(latency)
-            load_duration = _number(record.get("load_duration_seconds"))
-            if load_duration is not None:
-                load_durations.append(load_duration)
+            if not cache_hit:
+                latency = _number(record.get("latency_seconds"))
+                if latency is not None:
+                    latencies.append(latency)
+                    measured_latency_sample_count += 1
+                load_duration = _number(record.get("load_duration_seconds"))
+                if load_duration is not None:
+                    load_durations.append(load_duration)
 
         warmup_load_durations: list[float] = []
         for warmup in warmups_by_model.get(model, []):
@@ -324,6 +331,8 @@ def summarize(
                 "failure_rate": failed_count / len(model_records) if model_records else None,
                 "empty_count": empty_count,
                 "truncated_count": truncated_count,
+                "cache_hit_count": cache_hit_count,
+                "measured_latency_sample_count": measured_latency_sample_count,
                 "cer": cer,
                 "wer": wer,
                 "mean_sample_cer": mean_cer,

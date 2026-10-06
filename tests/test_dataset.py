@@ -373,3 +373,167 @@ def test_split_dataset_keeps_documents_together_and_rejects_image_leakage() -> N
     leaked[2] = {**leaked[2], "hashes": {"image": samples[0]["hashes"]["image"]}}
     with pytest.raises(ValueError, match="crosses documents"):
         split_dataset(leaked)
+
+
+def test_writer_disjoint_split_keeps_shared_writers_and_multi_writer_documents_together():
+    samples = [
+        {
+            "id": "a-1",
+            "source_document": "doc-a",
+            "writer_id": "writer-1",
+            "hashes": {"image": "a1"},
+        },
+        {
+            "id": "a-2",
+            "source_document": "doc-a",
+            "writer_id": "writer-2",
+            "hashes": {"image": "a2"},
+        },
+        {
+            "id": "b-1",
+            "source_document": "doc-b",
+            "writer_id": "writer-2",
+            "hashes": {"image": "b1"},
+        },
+        {
+            "id": "c-1",
+            "source_document": "doc-c",
+            "writer_id": "writer-3",
+            "hashes": {"image": "c1"},
+        },
+        {
+            "id": "d-1",
+            "source_document": "doc-d",
+            "writer_id": "writer-4",
+            "hashes": {"image": "d1"},
+        },
+        {
+            "id": "e-1",
+            "source_document": "doc-e",
+            "writer_id": "writer-5",
+            "hashes": {"image": "e1"},
+        },
+    ]
+
+    first = split_dataset(samples, seed=11, protocol="writer-disjoint")
+    second = split_dataset(samples, seed=11, protocol="writer-disjoint")
+
+    assert first == second
+    by_writer = {}
+    by_document = {}
+    for row in first:
+        by_writer.setdefault(row["writer_id"], set()).add(row["split"])
+        by_document.setdefault(row["source_document"], set()).add(row["split"])
+    assert all(len(splits) == 1 for splits in by_writer.values())
+    assert all(len(splits) == 1 for splits in by_document.values())
+    assert by_document["doc-a"] == by_document["doc-b"]
+
+
+def test_writer_disjoint_split_requires_writer_metadata():
+    with pytest.raises(ValueError, match="writer_id metadata"):
+        split_dataset(
+            [
+                {
+                    "id": "a",
+                    "source_document": "doc-a",
+                    "hashes": {"image": "image-a"},
+                }
+            ],
+            protocol="writer-disjoint",
+        )
+
+
+def test_dataset_check_marks_cross_split_document_overlap_invalid(tmp_path: Path):
+    data_dir = tmp_path / "data"
+    _sample(data_dir, "line-a")
+    _sample(data_dir, "line-b")
+    metadata = [
+        {
+            "id": "line-a",
+            "source_document": "exam-shared",
+            "split": "train",
+        },
+        {
+            "id": "line-b",
+            "source_document": "exam-shared",
+            "split": "test",
+        },
+    ]
+    (data_dir / "metadata.jsonl").write_text(
+        "".join(json.dumps(row) + "\n" for row in metadata), encoding="utf-8"
+    )
+
+    report = check_dataset(data_dir)
+
+    assert report["valid"] is False
+    assert any(issue["code"] == "document_split_overlap" for issue in report["issues"])
+    assert any(
+        finding["type"] == "document_split_overlap"
+        and finding["sample_ids"] == ["line-a", "line-b"]
+        for finding in report["findings"]
+    )
+
+
+def test_dataset_check_flags_perceptual_duplicates_for_review_only(tmp_path: Path):
+    data_dir = tmp_path / "data"
+    for sample_id, color, reference in (
+        ("white", (255, 255, 255), "white page"),
+        ("off-white", (254, 254, 254), "off-white page"),
+    ):
+        image = data_dir / "images" / f"{sample_id}.png"
+        text = data_dir / "text" / f"{sample_id}.txt"
+        image.parent.mkdir(parents=True, exist_ok=True)
+        text.parent.mkdir(parents=True, exist_ok=True)
+        Image.new("RGB", (40, 30), color).save(image)
+        text.write_text(reference, encoding="utf-8")
+
+    report = check_dataset(data_dir)
+
+    near_duplicates = [
+        finding
+        for finding in report["findings"]
+        if finding["type"] == "perceptual_duplicate_review"
+    ]
+    assert report["valid"] is True
+    assert len(near_duplicates) == 1
+    assert near_duplicates[0]["sample_ids"] == ["off-white", "white"]
+
+
+def test_task_annotations_are_preserved_and_schema_checked(tmp_path: Path):
+    data_dir = tmp_path / "data"
+    _sample(data_dir, "equation-1")
+    annotations = {
+        "critical_expressions": [r"x^2", r"= 0"],
+        "reading_order": [[r"x^2", r"= 0"]],
+    }
+    (data_dir / "metadata.jsonl").write_text(
+        json.dumps({"id": "equation-1", "annotations": annotations}) + "\n",
+        encoding="utf-8",
+    )
+
+    [sample] = prepare_dataset(data_dir, tmp_path / "prepared")
+
+    assert sample["metadata"]["annotations"] == annotations
+
+
+@pytest.mark.parametrize(
+    ("annotations", "message"),
+    [
+        ([], "annotations must be a JSON object"),
+        ({"critical_expressions": ["x", " "]}, "critical_expressions"),
+        ({"critical_expressions": ["x", "x"]}, "duplicate critical expressions"),
+        ({"reading_order": [["x"]]}, "entries must be pairs"),
+    ],
+)
+def test_task_annotation_schema_errors_are_explicit(
+    tmp_path: Path, annotations: object, message: str
+):
+    data_dir = tmp_path / "data"
+    _sample(data_dir, "equation-1")
+    (data_dir / "metadata.jsonl").write_text(
+        json.dumps({"id": "equation-1", "annotations": annotations}) + "\n",
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match=message):
+        prepare_dataset(data_dir, tmp_path / "prepared")

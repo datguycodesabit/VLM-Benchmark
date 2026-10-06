@@ -33,10 +33,13 @@ _MODEL_SUMMARY_COLUMNS = (
     "prompt_hashes",
     "prose_prompt_hash",
     "math_prompt_hash",
+    "task_metrics_options",
     "model_revision",
     "unsupported_reason",
     "eligible_sample_count",
     "scored_sample_count",
+    "cache_hit_count",
+    "measured_latency_sample_count",
     "failed_sample_count",
     "failure_rate",
     "missing_sample_count",
@@ -353,6 +356,11 @@ def _combine_runs(runs: list[dict[str, Any]], labels: list[str]):
                 "model_config": copy.deepcopy(capability),
                 "benchmark_version": manifest.get("benchmark_version"),
                 "scoring_version": manifest.get("scoring_version"),
+                "task_metrics_options": {
+                    key: copy.deepcopy(manifest[key])
+                    for key in ("formula_rendering", "task_metrics_version", "formula_renderer")
+                    if key in manifest
+                },
             }
 
         frozen_samples = {str(sample["id"]): sample for sample in samples}
@@ -374,6 +382,12 @@ def _combine_runs(runs: list[dict[str, Any]], labels: list[str]):
             record["run"] = run_label
             record["reference"] = reference
             prediction = record.get("prediction")
+            previous_metrics = record.get("metrics")
+            saved_task_metrics = (
+                copy.deepcopy(previous_metrics.get("task_metrics"))
+                if isinstance(previous_metrics, dict) and "task_metrics" in previous_metrics
+                else None
+            )
             if (
                 record.get("status") == "success"
                 and isinstance(prediction, str)
@@ -389,6 +403,10 @@ def _combine_runs(runs: list[dict[str, Any]], labels: list[str]):
                     record["metrics"] = None
             else:
                 record["metrics"] = None
+            if saved_task_metrics is not None:
+                if not isinstance(record.get("metrics"), dict):
+                    record["metrics"] = {}
+                record["metrics"]["task_metrics"] = saved_task_metrics
             merged_records.append(record)
 
         for source_warmup in run["warmups"]:
@@ -434,6 +452,7 @@ def _comparison_rows(report: dict[str, Any]) -> list[dict[str, Any]]:
                     "prompt_hashes": entry["prompt_hashes"],
                     "prose_prompt_hash": entry["prose_prompt_hash"],
                     "math_prompt_hash": entry["math_prompt_hash"],
+                    "task_metrics_options": entry["task_metrics_options"],
                     "model_revision": entry["model_revision"],
                     **result,
                 }
@@ -551,10 +570,15 @@ def compare(run_dirs, output_dir) -> dict[str, Any]:
     labels = _unique_run_labels(runs)
     merged_manifest, merged_records, entries = _combine_runs(runs, labels)
     aggregate = research_reports(merged_records, merged_manifest)
+    # Runs may use different task-scoring options. A combined aggregate would
+    # inherit one run's manifest and misstate how all saved scores were produced.
+    aggregate.pop("task_metrics", None)
 
     costs_by_run: dict[str, Any] = {}
+    per_run_reports: dict[str, dict[str, Any]] = {}
     for run, run_label in zip(runs, labels, strict=True):
         per_run_report = research_reports(run["records"], run["manifest"])
+        per_run_reports[run_label] = per_run_report
         costs_by_run[run_label] = per_run_report["cost_scenarios"]
     aggregate["cost_scenarios"] = {
         "runs": [
@@ -575,6 +599,23 @@ def compare(run_dirs, output_dir) -> dict[str, Any]:
                 "status": run["manifest"].get("status"),
                 "benchmark_version": run["manifest"].get("benchmark_version"),
                 "scoring_version": run["manifest"].get("scoring_version"),
+                "evaluation": {
+                    key: run["manifest"][key]
+                    for key in (
+                        "strict_research",
+                        "protocol",
+                        "research_protocol_version",
+                        "research",
+                        "source_audit",
+                        "validation_scope",
+                        "research_validation_boundary",
+                        "formula_rendering",
+                        "task_metrics_version",
+                        "formula_renderer",
+                    )
+                    if key in run["manifest"]
+                },
+                "task_metrics": copy.deepcopy(per_run_reports[label].get("task_metrics")),
                 "preprocess": run["preprocess"],
                 "models": [
                     entry for entry, metadata in entries.items() if metadata["run"] == label

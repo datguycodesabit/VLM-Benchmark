@@ -264,6 +264,117 @@ def test_report_includes_inference_end_to_end_failure_and_cold_load_timings():
     assert result["warmup_count"] == 1
 
 
+def test_cache_hits_score_accuracy_but_do_not_contribute_to_timing_or_throughput():
+    model = "openai:cached"
+    manifest = {
+        "samples": [
+            {
+                "id": sample_id,
+                "reference": reference,
+                "split": "test",
+                "verified": True,
+                "source_document": "doc-a",
+            }
+            for sample_id, reference in (
+                ("cached", "abcd"),
+                ("measured", "wxyz"),
+                ("failed", "mnop"),
+            )
+        ],
+        "models": [model],
+        "warmups": [
+            {
+                "model": model,
+                "sample_id": "measured",
+                "status": "success",
+                "response": {"load_duration": 400_000_000},
+            }
+        ],
+    }
+    records = [
+        _record(
+            model,
+            "cached",
+            "wxyz",
+            "abcd",
+            cache_hit=True,
+            latency_seconds=99.0,
+            inference_latency_seconds=88.0,
+            load_duration_seconds=77.0,
+        ),
+        _record(
+            model,
+            "measured",
+            "wxyz",
+            "wxyz",
+            latency_seconds=2.0,
+            inference_latency_seconds=1.8,
+            load_duration_seconds=0.1,
+        ),
+        _record(
+            model,
+            "failed",
+            None,
+            "mnop",
+            status="error",
+            latency_seconds=1.0,
+            inference_latency_seconds=0.9,
+            load_duration_seconds=0.2,
+        ),
+    ]
+
+    result = research_reports(records, manifest)["tracks"]["prose"]["model_results"][0]
+
+    assert result["scored_sample_count"] == 2
+    assert result["sample_coverage"] == pytest.approx(2 / 3)
+    assert result["cer"] == pytest.approx(0.5)
+    assert result["cache_hit_count"] == 1
+    assert result["measured_latency_sample_count"] == 2
+    assert result["mean_latency_seconds"] == pytest.approx(1.5)
+    assert result["total_latency_seconds"] == pytest.approx(3.0)
+    assert result["samples_per_minute"] == pytest.approx(20.0)
+    assert result["mean_inference_latency_seconds"] == pytest.approx(1.35)
+    assert result["total_inference_latency_seconds"] == pytest.approx(2.7)
+    assert result["inference_latency_count"] == 2
+    assert result["load_duration_seconds"] == pytest.approx(0.3)
+    assert result["cold_load_duration_seconds"] == pytest.approx(0.4)
+    assert result["warmup_count"] == 1
+
+
+def test_api_cost_excludes_cached_usage_even_if_a_cache_row_contains_tokens():
+    manifest = {
+        "samples": [],
+        "models": [],
+        "costs": {
+            "api": {
+                "model": "openai:cached",
+                "input_per_million_usd": 10,
+                "output_per_million_usd": 20,
+            }
+        },
+    }
+    records = [
+        {
+            **_record("openai:cached", "cache", "x", "x"),
+            "cache_hit": True,
+            "usage": {"input_tokens": 100_000, "output_tokens": 100_000},
+        },
+        {
+            **_record("openai:cached", "live", "x", "x"),
+            "usage": {"input_tokens": 100, "output_tokens": 50},
+        },
+    ]
+
+    estimate = research_reports(records, manifest)["cost_scenarios"]["api_usage_estimate"]
+
+    assert estimate["usage_record_count"] == 1
+    assert estimate["excluded_cache_hit_count"] == 1
+    assert estimate["unpriced_attempt_count"] == 0
+    assert estimate["input_tokens"] == 100
+    assert estimate["output_tokens"] == 50
+    assert estimate["estimated_observed_cost_usd"] == pytest.approx(0.002)
+
+
 def test_cost_projection_does_not_guess_missing_values_and_calculates_break_even():
     unknown = research_reports([], {"models": [], "samples": []})["cost_scenarios"]
     assert unknown["break_even"] == {"status": "unknown_missing_cost_inputs", "samples": None}

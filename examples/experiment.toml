@@ -7,6 +7,17 @@ models = [
   "trocr:microsoft/trocr-base-handwritten",
 ]
 warmup = true
+strict_research = false
+protocol = "document-disjoint"
+formula_rendering = false
+
+# Optional execution controls. Request and spend allowances apply to each run
+# invocation and start fresh when a stopped run is resumed.
+# max_retries = 2
+# concurrency = 1 # values above 1 are supported for cloud providers only
+# max_requests = 500
+# max_spend_usd = 10.00 # requires prices for every selected cloud model
+# cache_dir = "../runs/response-cache" # off unless a path is configured
 
 [models."trocr:microsoft/trocr-base-handwritten"]
 device = "auto"

@@ -3,7 +3,7 @@ include pyproject.toml
 recursive-include src *.py
 recursive-include tests *.py
 recursive-include docs *.md
-recursive-include examples *.toml
+recursive-include examples *.toml *.py
 prune data
 prune runs
 prune benchmarks

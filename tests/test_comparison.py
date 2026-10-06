@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import copy
+import csv
 import hashlib
 import json
 
@@ -122,8 +123,17 @@ def test_compare_matched_runs_relabels_entries_and_preserves_sources(tmp_path, s
         samples,
         ["ollama:local", "trocr:entry-id"],
         [
-            _record("ollama:local", "p1", "hello"),
-            _record("ollama:local", "p2", "world"),
+            _record(
+                "ollama:local",
+                "p1",
+                "hello",
+                cache_hit=True,
+                cache_lookup_seconds=0.003,
+                cache_bypass_reason=None,
+                latency_seconds=None,
+                inference_latency_seconds=None,
+            ),
+            _record("ollama:local", "p2", "world", cache_hit=False),
             _record("ollama:local", "eq1", "x = 1"),
             _record("trocr:entry-id", "p1", "hello"),
             _record("trocr:entry-id", "p2", "world"),
@@ -139,6 +149,9 @@ def test_compare_matched_runs_relabels_entries_and_preserves_sources(tmp_path, s
             }
         },
         prompt="Prompt A",
+        strict_research=True,
+        protocol="writer-disjoint",
+        research_protocol_version=1,
     )
     second = _make_run(
         tmp_path,
@@ -161,6 +174,9 @@ def test_compare_matched_runs_relabels_entries_and_preserves_sources(tmp_path, s
         },
         prompt="Prompt B",
         model_info={"ollama:local": {"digest": "revision-b"}},
+        strict_research=True,
+        protocol="writer-disjoint",
+        research_protocol_version=1,
     )
     before = {
         path: {child.name: child.read_bytes() for child in path.iterdir() if child.is_file()}
@@ -174,6 +190,9 @@ def test_compare_matched_runs_relabels_entries_and_preserves_sources(tmp_path, s
     second_entry = "ollama:local@run-b"
     trocr_entry = "trocr:entry-id@run-a"
     assert report["benchmark_fingerprint"]
+    assert report["runs"][0]["evaluation"]["strict_research"] is True
+    assert report["runs"][0]["evaluation"]["protocol"] == "writer-disjoint"
+    assert report["runs"][0]["evaluation"]["research_protocol_version"] == 1
     assert report["entries"][first_entry]["prompt"] == "Prompt A"
     assert report["entries"][first_entry]["settings"] == {"num_predict": 256}
     assert report["entries"][second_entry]["settings"] == {"num_predict": 512}
@@ -188,6 +207,8 @@ def test_compare_matched_runs_relabels_entries_and_preserves_sources(tmp_path, s
     assert report["entries"][second_entry]["model_revision"] == {"digest": "revision-b"}
     assert report["model_info"][trocr_entry] == {"digest": "revision-trocr:entry-id"}
     assert _entry_result(report, "prose", first_entry)["cer"] == 0
+    assert _entry_result(report, "prose", first_entry)["cache_hit_count"] == 1
+    assert _entry_result(report, "prose", first_entry)["measured_latency_sample_count"] == 1
     assert _entry_result(report, "prose", second_entry)["cer"] == pytest.approx(1 / 10)
     assert _entry_result(report, "equation", trocr_entry)["status"] == "unsupported"
     assert _entry_result(report, "equation", trocr_entry)["rank"] is None
@@ -207,8 +228,19 @@ def test_compare_matched_runs_relabels_entries_and_preserves_sources(tmp_path, s
             "prose_prompt_hash",
             "math_prompt_hash",
             "model_revision",
+            "cache_hit_count",
+            "measured_latency_sample_count",
         )
     )
+    with (output / "comparison.csv").open(encoding="utf-8-sig", newline="") as file:
+        comparison_rows = csv.DictReader(file)
+        local_prose = next(
+            row
+            for row in comparison_rows
+            if row["track"] == "prose" and row["model"] == first_entry
+        )
+    assert local_prose["cache_hit_count"] == "1"
+    assert local_prose["measured_latency_sample_count"] == "1"
     assert "ci95_low" in (output / "paired.csv").read_text(encoding="utf-8-sig").splitlines()[0]
     after = {
         path: {child.name: child.read_bytes() for child in path.iterdir() if child.is_file()}
@@ -312,3 +344,76 @@ def test_compare_canonicalizes_bare_ollama_model_ids(tmp_path, samples):
 
     assert "ollama:qwen:tag@run-a" in report["entries"]
     assert report["entries"]["ollama:qwen:tag@run-a"]["model"] == "qwen:tag"
+
+
+def test_compare_preserves_task_scores_and_separates_per_run_scorer_options(
+    tmp_path, samples, monkeypatch
+):
+    from vlm_bench import task_metrics
+
+    def saved_task_score(status, value):
+        return {
+            "version": 1,
+            "scores": {
+                "formula_render_similarity": {"status": status, "value": value},
+                "critical_expression_accuracy": {"status": "not_annotated", "value": None},
+                "reading_order_accuracy": {"status": "not_annotated", "value": None},
+            },
+            "errors": [],
+        }
+
+    first_record = _record("ollama:literal", "eq1", "x = 1", reference="wrong")
+    first_record["metrics"] = {"cer": 0.8, "task_metrics": saved_task_score("disabled", None)}
+    second_record = _record("openai:rendered", "eq1", r"x\;=\;1", reference="wrong")
+    second_record["metrics"] = {"cer": 0.1, "task_metrics": saved_task_score("scored", 0.95)}
+    first = _make_run(
+        tmp_path,
+        "run-a",
+        samples,
+        ["ollama:literal"],
+        [first_record],
+        formula_rendering=False,
+        task_metrics_version=1,
+    )
+    second = _make_run(
+        tmp_path,
+        "run-b",
+        samples,
+        ["openai:rendered"],
+        [second_record],
+        formula_rendering=True,
+        task_metrics_version=1,
+        formula_renderer={"name": "matplotlib-mathtext", "version": "3.10.3"},
+    )
+    monkeypatch.setattr(
+        task_metrics,
+        "score_task",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must use saved scores")),
+    )
+
+    output = tmp_path / "comparison"
+    report = comparison.compare([first, second], output)
+    assert "task_metrics" not in report
+    assert report["runs"][0]["task_metrics"]["formula_rendering_enabled"] is False
+    assert report["runs"][1]["task_metrics"]["formula_rendering_enabled"] is True
+    assert report["runs"][1]["evaluation"]["formula_renderer"]["version"] == "3.10.3"
+    assert (
+        report["entries"]["ollama:literal@run-a"]["task_metrics_options"]["formula_rendering"]
+        is False
+    )
+    assert (
+        report["entries"]["openai:rendered@run-b"]["task_metrics_options"]["formula_rendering"]
+        is True
+    )
+    equation_results = report["tracks"]["equation"]["model_results"]
+    ranked = sorted(equation_results, key=lambda row: row["rank"])
+    assert ranked[0]["model"] == "ollama:literal@run-a"
+    metric_report = next(
+        model
+        for model in report["runs"][1]["task_metrics"]["tracks"]["equation"]["models"]
+        if model["model"] == "openai:rendered"
+    )
+    assert metric_report["metrics"]["formula_render_similarity"]["status_counts"] == {"scored": 1}
+    with (output / "comparison.csv").open(encoding="utf-8-sig", newline="") as handle:
+        rows = list(csv.DictReader(handle))
+    assert "task_metrics_options" in rows[0]

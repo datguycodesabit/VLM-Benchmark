@@ -342,6 +342,9 @@ def _track_report(
         latencies: list[float] = []
         inference_latencies: list[float] = []
         load_durations: list[float] = []
+        cache_hit_count = 0
+        measured_latency_sample_count = 0
+        cache_scored_count = 0
         truncated_count = 0
         empty_count = 0
         for sample_id in eligible:
@@ -350,15 +353,20 @@ def _track_report(
                 continue
             if record.get("truncated") is True:
                 truncated_count += 1
-            latency = _finite_number(record.get("latency_seconds"))
-            if latency is not None:
-                latencies.append(latency)
-            inference_latency = _finite_number(record.get("inference_latency_seconds"))
-            if inference_latency is not None:
-                inference_latencies.append(inference_latency)
-            load_duration = _finite_number(record.get("load_duration_seconds"))
-            if load_duration is not None:
-                load_durations.append(load_duration)
+            cache_hit = record.get("cache_hit") is True
+            if cache_hit:
+                cache_hit_count += 1
+            else:
+                latency = _finite_number(record.get("latency_seconds"))
+                if latency is not None:
+                    latencies.append(latency)
+                    measured_latency_sample_count += 1
+                inference_latency = _finite_number(record.get("inference_latency_seconds"))
+                if inference_latency is not None:
+                    inference_latencies.append(inference_latency)
+                load_duration = _finite_number(record.get("load_duration_seconds"))
+                if load_duration is not None:
+                    load_durations.append(load_duration)
             if record.get("status") == "unsupported":
                 unsupported_ids.append(sample_id)
                 continue
@@ -389,6 +397,8 @@ def _track_report(
                     "metrics": metrics,
                 }
             )
+            if cache_hit:
+                cache_scored_count += 1
         model_rows[model] = scored
         scored_count = len(scored)
         char_edits = sum(row["metrics"]["char_edits"] for row in scored)
@@ -466,6 +476,8 @@ def _track_report(
                 "failed_sample_ids": sorted(set(failed_ids)),
                 "sample_coverage": scored_count / len(eligible) if eligible else None,
                 "success_count": scored_count,
+                "cache_hit_count": cache_hit_count,
+                "measured_latency_sample_count": measured_latency_sample_count,
                 "empty_count": empty_count,
                 "cer": cer,
                 "wer": wer,
@@ -477,7 +489,7 @@ def _track_report(
                 "p95_latency_seconds": _percentile(latencies, 0.95),
                 "total_latency_seconds": total_latency,
                 "samples_per_minute": (
-                    scored_count * 60 / total_latency
+                    (scored_count - cache_scored_count) * 60 / total_latency
                     if total_latency is not None and total_latency > 0
                     else None
                 ),
@@ -655,10 +667,14 @@ def _api_observed_unit_cost(
 
     usage_record_count = 0
     unpriced_attempt_count = 0
+    excluded_cache_hit_count = 0
     input_tokens_total = output_tokens_total = cached_tokens_total = 0
     observed_total = 0.0
     for row in records:
         if row.get("model") != selector or row.get("status") == "unsupported":
+            continue
+        if row.get("cache_hit") is True:
+            excluded_cache_hit_count += 1
             continue
         usage = row.get("usage")
         if not isinstance(usage, dict):
@@ -701,6 +717,7 @@ def _api_observed_unit_cost(
         "model": selector,
         "usage_record_count": usage_record_count,
         "unpriced_attempt_count": unpriced_attempt_count,
+        "excluded_cache_hit_count": excluded_cache_hit_count,
         "input_tokens": input_tokens_total,
         "output_tokens": output_tokens_total,
         "cached_input_tokens": cached_tokens_total,
@@ -797,6 +814,8 @@ def research_reports(records: list[dict[str, Any]], manifest: dict[str, Any]) ->
         raise TypeError("records must be a list of dictionaries")
     if not isinstance(manifest, dict):
         raise TypeError("manifest must be a dictionary")
+
+    from .task_metrics import aggregate_task_metrics
 
     manifest_samples = manifest.get("samples", [])
     has_frozen_samples = isinstance(manifest_samples, list)
@@ -902,8 +921,34 @@ def research_reports(records: list[dict[str, Any]], manifest: dict[str, Any]) ->
         )
         for track in _TRACKS
     }
+    evaluation = manifest.get("evaluation", {})
+    if not isinstance(evaluation, dict):
+        evaluation = {}
+    else:
+        evaluation = dict(evaluation)
+    for key in (
+        "strict_research",
+        "protocol",
+        "research_protocol_version",
+        "formula_rendering",
+        "task_metrics_version",
+        "formula_renderer",
+        "source_audit",
+        "validation_scope",
+        "research_validation_boundary",
+        "research",
+    ):
+        if key in manifest:
+            evaluation.setdefault(key, manifest[key])
     return {
         "schema_version": 1,
+        "evaluation": evaluation,
+        "task_metrics": aggregate_task_metrics(
+            records,
+            eligible_samples,
+            model_names,
+            formula_rendering_enabled=manifest.get("formula_rendering", False) is True,
+        ),
         "unexpected_result_pairs": [
             {"model": model, "sample_id": sample_id}
             for model, sample_id in sorted(unexpected_result_pairs)

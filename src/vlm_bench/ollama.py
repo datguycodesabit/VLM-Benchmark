@@ -11,6 +11,8 @@ from urllib.parse import urlsplit
 
 import httpx
 
+from .execution import RetryableProviderError
+
 
 class OllamaClient:
     """Call a loopback Ollama server without pulling or forwarding models.
@@ -104,6 +106,14 @@ class OllamaClient:
     ) -> dict[str, Any]:
         try:
             response = self._client.request(method, path, json=payload)
+        except (httpx.ConnectError, httpx.ConnectTimeout) as exc:
+            if path == "/api/chat":
+                raise RetryableProviderError(
+                    "Ollama connection failed before response", category="connection_error"
+                ) from None
+            raise RuntimeError(
+                f"Ollama request {method} {path} failed ({type(exc).__name__})"
+            ) from None
         except httpx.TimeoutException as exc:
             raise RuntimeError(
                 f"Ollama request {method} {path} timed out after {self.timeout:g} seconds"
@@ -112,6 +122,22 @@ class OllamaClient:
             raise RuntimeError(f"Ollama request {method} {path} failed: {exc}") from exc
 
         if not response.is_success:
+            if path == "/api/chat" and response.status_code == 429:
+                raw_delay = response.headers.get("Retry-After")
+                try:
+                    delay = max(0.0, float(raw_delay)) if raw_delay is not None else None
+                except ValueError:
+                    delay = None
+                raise RetryableProviderError(
+                    "Ollama generation was rate limited",
+                    retry_after_seconds=delay,
+                    category="rate_limited",
+                )
+            if path == "/api/chat" and response.status_code in {500, 502, 503, 504}:
+                raise RetryableProviderError(
+                    f"Ollama generation returned temporary HTTP {response.status_code}",
+                    category=f"http_{response.status_code}",
+                )
             raise RuntimeError(
                 f"Ollama request {method} {path} failed "
                 f"(HTTP {response.status_code}): {self._describe_error(response)}"

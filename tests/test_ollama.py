@@ -216,6 +216,40 @@ def test_transcribe_reports_server_error_field(tmp_path: Path) -> None:
             client.transcribe("missing", image_path, "transcribe", {})
 
 
+def test_only_generation_endpoint_exposes_safe_retryable_http_errors() -> None:
+    from vlm_bench.execution import RetryableProviderError
+
+    def rate_limit(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            429,
+            headers={"Retry-After": "0.2"},
+            json={"error": "busy"},
+            request=request,
+        )
+
+    with OllamaClient(transport=httpx.MockTransport(rate_limit)) as client:
+        with pytest.raises(RetryableProviderError) as caught:
+            client._request_json("POST", "/api/chat", payload={"model": "vision"})
+        assert caught.value.retry_after_seconds == pytest.approx(0.2)
+        assert caught.value.category == "rate_limited"
+        with pytest.raises(RuntimeError, match="HTTP 429"):
+            client._request_json("GET", "/api/tags")
+
+
+def test_generation_connect_error_is_safe_but_metadata_connect_error_is_permanent() -> None:
+    from vlm_bench.execution import RetryableProviderError
+
+    def disconnected(request: httpx.Request) -> httpx.Response:
+        raise httpx.ConnectError("private detail", request=request)
+
+    with OllamaClient(transport=httpx.MockTransport(disconnected)) as client:
+        with pytest.raises(RetryableProviderError) as caught:
+            client._request_json("POST", "/api/chat", payload={"model": "vision"})
+        assert caught.value.category == "connection_error"
+        with pytest.raises(RuntimeError, match="ConnectError"):
+            client._request_json("GET", "/api/version")
+
+
 def test_client_wraps_timeout_and_malformed_json(tmp_path: Path) -> None:
     def timeout(request: httpx.Request) -> httpx.Response:
         raise httpx.ReadTimeout("read timed out", request=request)

@@ -99,13 +99,14 @@ complete.
 
 Training, validation, and test samples from the same exam or source document
 would make the evaluation overly optimistic. Add `source_document` metadata
-first, then assign whole documents to reproducible 70/15/15 splits:
+first, then assign whole documents to reproducible 70/15/15 splits. The default
+protocol is `document-disjoint`:
 
 ```bash
 uv run vlm-bench dataset split \
   --data data/brothers \
   --output /tmp/brothers-splits.jsonl \
-  --seed 42
+  --seed 42 --protocol document-disjoint
 ```
 
 The split command creates new metadata and refuses to overwrite an existing
@@ -119,8 +120,21 @@ cp /tmp/brothers-splits.jsonl data/brothers/metadata.jsonl
 
 If you have no existing metadata file, copy the generated file into
 `data/brothers/metadata.jsonl`. Re-run `dataset check` and inspect the split
-counts. The splitter checks that exact duplicate images do not cross documents.
-Do not change the test set after looking at model results.
+counts. The splitter checks that exact duplicate image bytes do not cross
+documents. For a writer-held-out study, require `writer_id` on every sample and
+select the writer-disjoint protocol:
+
+```bash
+uv run vlm-bench dataset split --data data/brothers \
+  --output /tmp/brothers-writer-splits.jsonl \
+  --seed 42 --protocol writer-disjoint
+```
+
+Writer-disjoint splitting also preserves each source document as one unit. It
+joins documents connected through shared writers, including pages containing
+multiple writers, so those connected groups cannot cross a split. It fails
+visibly when a writer ID or source document is missing. Do not change the test
+set after looking at model results.
 
 The shipped IAM archive is useful for public-data smoke tests. Use its
 documented evaluation partitions where available. The standard handwritten
@@ -154,6 +168,9 @@ uv run vlm-bench dataset check --prepared data/brothers/prepared-test
 This check reports the snapshot version, sample count, and benchmark
 fingerprint. The fingerprint identifies the frozen benchmark and is carried
 into each run so separate model runs can be checked against the same inputs.
+For source datasets, the audit also reports document/writer split overlaps and
+perceptually similar images. Split overlaps are integrity findings; perceptual
+matches are review suggestions, not automatic proof of leakage.
 
 ## 5. Preview and run each model on the snapshot
 
@@ -278,12 +295,14 @@ source documents as groups when document IDs are available, and uses individual
 samples otherwise. A negative `right minus left` CER difference means the
 right-hand model had lower error in that pair.
 
-Timing summaries show end-to-end request latency and inference latency when
-the provider reports it. For cloud calls, inference latency includes network
-time and retries. Throughput is successful samples per minute divided by total
-measured end-to-end request time. Cold model-load time comes from a successful
+Timing summaries use measured model-request latency; cached responses have no
+inference latency and are excluded from latency averages and throughput.
+`attempts.jsonl` records each retry, its status, duration, and provider retry
+delay separately. Throughput is based on successful measured requests and
+their recorded request durations. Cold model-load time comes from a successful
 warmup when available, or from load timing on sample requests when warmup is
-disabled. Missing measurements remain blank.
+disabled. Missing measurements remain blank. Imported timing is marked
+external and is not represented as native model inference timing.
 
 Equation scoring uses Unicode NFC and whitespace normalization, while
 preserving operators and LaTeX syntax. It measures literal transcription,
@@ -296,3 +315,246 @@ research question is whether specialization provides enough improvement for
 students to justify data preparation, fine-tuning, and local operation. A
 result showing that another method is more accurate or more economical is also
 a useful finding.
+
+## 8. Check research eligibility before inference
+
+Exploratory runs remain the default. Add `--strict-research` when the run
+should enforce the research protocol. Every evaluated sample must have a
+nonempty reference, an explicit verified state (`verified: true` or a verified
+`verification_status`), a test split, and a `source_document`. A
+`writer-disjoint` evaluation also requires `writer_id` on every sample.
+Conflicting verification fields are treated as unverified. Strict source-data
+runs audit the complete dataset before selecting the test samples, so a
+document that appears in multiple splits blocks the run. Writer overlap also
+blocks writer-disjoint runs.
+
+```bash
+uv run vlm-bench run --data data/brothers \
+  --models ollama:qwen2.5vl:3b --strict-research \
+  --protocol document-disjoint --dry-run
+```
+
+For a prepared snapshot, strict validation is limited to the samples included
+in that snapshot. It cannot establish that unseen training or validation data
+are free of leakage. The manifest and research report retain the protocol,
+eligibility settings, audit findings, and the validation boundary. Exact
+duplicate images and document/writer split overlaps are reported as integrity
+issues; perceptually similar images are review findings that require human
+inspection.
+
+## 9. Inspect errors and compare subgroups
+
+Use a completed run to create an HTML error review without another model call.
+The default file is `RUN/inspection.html`; use `--output` to choose another
+local path.
+
+```bash
+uv run vlm-bench inspect --run runs/YOUR_RUN_DIRECTORY --worst 20
+uv run vlm-bench inspect --run runs/YOUR_RUN_DIRECTORY --worst 50 \
+  --output reviews/brothers.html
+```
+
+The terminal summary and HTML page show references, predictions, edit
+alignments, insertions, deletions, substitutions, and flags for empty,
+truncated, repeated, or commentary-like outputs. The HTML report uses the
+frozen local images and escapes displayed text.
+
+Aggregate the same saved results by a metadata field:
+
+```bash
+uv run vlm-bench report --run runs/YOUR_RUN_DIRECTORY --group-by writer_id
+uv run vlm-bench report --run runs/YOUR_RUN_DIRECTORY --group-by difficulty
+uv run vlm-bench report --run runs/YOUR_RUN_DIRECTORY --group-by source_document
+uv run vlm-bench report --run runs/YOUR_RUN_DIRECTORY --group-by sample_type
+```
+
+Each group includes sample and document counts, eligible coverage, and model
+metrics. Missing metadata forms an explicit `unknown` group. These commands
+read saved run data and do not perform inference.
+
+## 10. Score formulas and page annotations
+
+Literal equation CER/WER remain the default. Optional rendered similarity
+requires the pinned MathText dependency:
+
+```bash
+uv sync --extra formula-render
+uv run vlm-bench run --prepared data/brothers/prepared-equations \
+  --models ollama:qwen2.5vl:3b --formula-rendering
+```
+
+The renderer uses Matplotlib MathText, a fixed font/configuration, and aligned
+foreground-pixel intersection-over-union. It supports MathText's TeX-like subset, not a full
+LaTeX engine; unsupported expressions, oversized input, and rasterization
+errors are recorded as metric errors rather than hidden. CER/WER remain
+available when rendering fails. Renderer availability and pinned version are
+checked before inference.
+
+Optional semantic task annotations are supplied as fields in the sample's
+`metadata.jsonl` record and are preserved inside each frozen sample's
+`metadata.annotations`:
+
+```json
+{
+  "id": "exam2006/page03-line02",
+  "content_type": "equation",
+  "annotations": {
+    "critical_expressions": ["x^2", "= 0"],
+    "reading_order": [["x^2", "= 0"]]
+  }
+}
+```
+
+`critical_expressions` scores each expression by requiring its normalized
+occurrence count in the prediction to match the reference. Each `reading_order`
+pair checks that two anchors occur exactly once in the reference in the
+declared order, and then checks the same order in the prediction. Missing or
+ambiguous reference anchors produce a metric error; missing or ambiguous
+prediction anchors score as a mismatch. Annotations are optional, and missing
+ones are reported as not annotated. Per-metric scores, errors, and annotation
+coverage are reported separately. They are not combined with CER/WER into a
+single ranking.
+
+## 11. Import external predictions and OCR baselines
+
+The importer accepts one JSON object per line, without a header. Each row
+requires `sample_id` and `prediction`; `status`, `latency_seconds`, and
+`usage` are optional. The importer rejects duplicate and unknown IDs. Missing
+sample rows are retained as incomplete coverage and cannot receive a full
+coverage rank. Imported timing and usage are labeled external.
+
+```bash
+uv run vlm-bench import --prepared data/brothers/prepared-test \
+  --predictions predictions.jsonl --system tesseract \
+  --provenance-file predictions.jsonl.provenance.json \
+  --output runs/tesseract
+```
+
+Use either `--provenance "description"` or `--provenance-file FILE`; the
+provenance file must contain a JSON object. The system name becomes the
+selector `external:<system>`, so imported runs can be inspected, exported,
+rescored, and compared with native runs on the same snapshot.
+
+The Tesseract example runs an already-installed `tesseract` binary and
+records its actual reported version, language, OEM, PSM, preprocessing, and
+task scope. It selects PSM 7 for lines, 8 for words, and 6 for pages; use
+`--expected-version` to require a known build. PaddleOCR's example uses pinned
+`paddleocr==3.7.0` and `paddlepaddle==3.2.0` with named PP-OCRv6 models and
+records its device, preprocessing, and text-joining policy. Run it in an
+isolated uv invocation:
+
+```bash
+uv run --with "paddleocr==3.7.0" --with "paddlepaddle==3.2.0" \
+  python examples/paddleocr_predictions.py \
+  --prepared data/brothers/prepared-test --output paddle.jsonl
+```
+
+Both generators write a JSONL file and a `.provenance.json` sidecar. Their
+automated tests mock OCR calls; real OCR inference was not run for this
+implementation.
+
+## 12. Compare named experiment conditions and repetitions
+
+Version 1 remains the format for a single experiment in
+[`../examples/experiment.toml`](../examples/experiment.toml). Version 2 adds
+named suite conditions, per-condition model controls and prompts, and
+repetitions. The example suite uses a frozen prepared snapshot and two prompt
+conditions:
+
+```bash
+uv run vlm-bench suite --config examples/suite.toml \
+  --output runs/prompt-suite --dry-run
+uv run vlm-bench suite --config examples/suite.toml \
+  --output runs/prompt-suite
+uv run vlm-bench suite --config examples/suite.toml \
+  --output runs/prompt-suite --resume
+```
+
+Preview lists the planned runs and benchmark fingerprints without inference.
+Each condition/repetition has a distinct run identity; resuming reuses
+completed runs and continues incomplete ones. A paired comparison is created
+only for conditions with matching evaluation fingerprints; conditions with
+different snapshots can run but are not compared as matched evaluations.
+Shared sample and document counts are not multiplied by the repetition count,
+and repeated-measurement variability is reported separately from
+document-bootstrap uncertainty.
+Incomplete repetitions do not contribute to variability summaries. Repeated
+measurements bypass response caching. Choose prompts and controls on
+validation data, then freeze them before test evaluation; do not select them
+by repeatedly checking test results.
+
+Each condition may use a different prepared snapshot for a genuinely
+different preprocessing or sample condition. Only condition pairs with
+matching fingerprints receive matched comparisons.
+
+## 13. Retries, limits, caching, status, and JSON
+
+Transient provider errors receive up to two retries by default; permanent
+errors fail immediately. Provider retry delays are honored and every attempt
+is recorded in `attempts.jsonl`. Cloud concurrency defaults to one; values
+above one are supported for OpenAI and ChatGPT providers. Local backends stay
+serial.
+
+Use `--max-requests N` to stop scheduling after the configured number of
+generation attempts, including warmups and retries. Use `--max-spend-usd N`
+to stop based on observed or projected provider usage. A spend limit requires
+applicable pricing for every selected cloud model. Unknown usage prevents
+additional spend-limited calls. These limits are per invocation, including
+each resume invocation; status distinguishes the current invocation from
+cumulative totals. The spend limit is an estimate, not a hard invoice cap:
+token usage is unknown until a response arrives, and concurrent in-flight
+requests may overshoot it. Completed predictions are saved before pausing so
+the run can be resumed with a new allowance.
+
+```bash
+uv run vlm-bench run --prepared data/brothers/prepared-test \
+  --models openai:MODEL_ID --max-retries 2 --concurrency 2 \
+  --max-requests 100
+uv run vlm-bench status --run runs/YOUR_RUN_DIRECTORY
+```
+
+For a spend limit, provide rates for the same selected API model in the TOML
+config. The model ID below is a placeholder; enter the provider's current
+prices before running:
+
+```toml
+version = 1
+
+[experiment]
+prepared = "../data/brothers/prepared-test"
+models = ["openai:MODEL_ID"]
+max_spend_usd = 5.00
+
+[costs.api]
+model = "openai:MODEL_ID"
+input_per_million_usd = 1.00
+output_per_million_usd = 4.00
+```
+
+Save this as `experiments/budgeted-api.toml`, replace the model and sample
+rates with current values, then run:
+
+```bash
+uv run vlm-bench run --config experiments/budgeted-api.toml
+```
+
+The configured cost model must match the selected API model; without
+applicable rates, a spend-limited run stops before inference.
+
+Response caching is disabled unless `--cache-dir PATH` or
+`experiment.cache_dir` is supplied. The cache key includes image/crop content,
+immutable model identity, prompt, and effective controls. It bypasses
+repetitions, stochastic settings, missing image hashes, and model identities
+without a fixed revision or digest. Cache hits still contribute their saved
+predictions to accuracy and coverage, but have no provider usage and no
+inference latency. They are excluded from latency and observed-usage
+summaries; reports show cache-hit and measured-latency counts. Treat the cache
+directory as local experiment data.
+
+Put `--json` before a command to produce one JSON response. Progress remains
+on standard error, leaving standard output parseable:
+
+```bash
+uv run vlm-bench --json status --run runs/YOUR_RUN_DIRECTORY
+uv run vlm-bench --json report --run runs/YOUR_RUN_DIRECTORY --group-by writer_id
+```

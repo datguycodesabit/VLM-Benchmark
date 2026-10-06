@@ -31,6 +31,7 @@ _METADATA_FIELDS = {
     "difficulty",
     "verification_status",
     "sample_type",
+    "annotations",
 }
 _SPLITS = {"train", "validation", "test"}
 
@@ -95,8 +96,38 @@ def _load_metadata(data_dir: Path) -> dict[str, dict[str, Any]]:
         sample_id = sample_id.strip()
         if sample_id in records:
             raise ValueError(f"Duplicate metadata ID {sample_id!r} in {path}")
-        records[sample_id] = {key: value[key] for key in _METADATA_FIELDS if key in value}
+        record = {key: value[key] for key in _METADATA_FIELDS if key in value}
+        if "annotations" in record:
+            _validate_task_annotations(sample_id, record["annotations"])
+        records[sample_id] = record
     return records
+
+
+def _validate_task_annotations(sample_id: str, annotations: Any) -> None:
+    """Validate optional equation and relative-reading-order annotations."""
+    if not isinstance(annotations, dict):
+        raise ValueError(f"Sample {sample_id!r} annotations must be a JSON object")
+    critical = annotations.get("critical_expressions", [])
+    if not isinstance(critical, list) or any(
+        not isinstance(expression, str) or not expression.strip() for expression in critical
+    ):
+        raise ValueError(
+            f"Sample {sample_id!r} annotations.critical_expressions must be a list of non-empty strings"
+        )
+    if len(set(critical)) != len(critical):
+        raise ValueError(f"Sample {sample_id!r} has duplicate critical expressions")
+    reading_order = annotations.get("reading_order", [])
+    if not isinstance(reading_order, list):
+        raise ValueError(f"Sample {sample_id!r} annotations.reading_order must be a list of pairs")
+    for pair in reading_order:
+        if (
+            not isinstance(pair, list)
+            or len(pair) != 2
+            or any(not isinstance(anchor, str) or not anchor.strip() for anchor in pair)
+        ):
+            raise ValueError(
+                f"Sample {sample_id!r} annotations.reading_order entries must be pairs of non-empty strings"
+            )
 
 
 def _metadata_for(
@@ -869,6 +900,147 @@ def _duplicate_groups(values: dict[str, str]) -> list[list[str]]:
     return [sorted(ids) for ids in grouped.values() if len(ids) > 1]
 
 
+def _sample_value(sample: dict[str, Any], field: str) -> Any:
+    value = sample.get(field)
+    if value not in (None, ""):
+        return value
+    metadata = sample.get("metadata")
+    return metadata.get(field) if isinstance(metadata, dict) else None
+
+
+def _normalized_split(value: Any) -> str | None:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    normalized = value.strip().lower().replace("_", "-")
+    return {
+        "testing": "test",
+        "eval": "test",
+        "evaluation": "test",
+        "heldout": "test",
+        "held-out": "test",
+        "training": "train",
+        "valid": "validation",
+        "dev": "validation",
+    }.get(normalized, normalized)
+
+
+def _split_overlap_findings(
+    samples: list[dict[str, Any]], field: str, finding_type: str
+) -> list[dict[str, Any]]:
+    grouped: dict[str, dict[str, list[str]]] = {}
+    for sample in samples:
+        group = _sample_value(sample, field)
+        split = _normalized_split(_sample_value(sample, "split"))
+        if not isinstance(group, str) or not group.strip():
+            continue
+        if split is None:
+            continue
+        grouped.setdefault(group.strip(), {}).setdefault(split, []).append(
+            str(sample.get("id", "<unknown>"))
+        )
+    findings = []
+    for group, splits in sorted(grouped.items()):
+        if len(splits) < 2:
+            continue
+        findings.append(
+            {
+                "type": finding_type,
+                field: group,
+                "splits": sorted(splits),
+                "sample_ids": sorted(sample_id for ids in splits.values() for sample_id in ids),
+            }
+        )
+    return findings
+
+
+def _perceptual_duplicate_findings(
+    samples: list[dict[str, Any]], max_hamming_distance: int = 4
+) -> tuple[list[dict[str, Any]], list[dict[str, str]]]:
+    """Find visually similar images with a small difference-hash distance.
+
+    Findings are review suggestions only. Exact duplicate bytes are already
+    reported separately and are omitted here to keep the audit concise.
+    """
+    hashes: dict[str, tuple[int, str]] = {}
+    errors: list[dict[str, str]] = []
+    for sample in samples:
+        sample_id = str(sample.get("id", "<unknown>"))
+        image_path = sample.get("image_path")
+        if not isinstance(image_path, str) or not image_path:
+            continue
+        try:
+            with Image.open(image_path) as image:
+                pixels = image.convert("L").resize((9, 8), Image.Resampling.LANCZOS).tobytes()
+        except (OSError, ValueError, UnidentifiedImageError) as exc:
+            errors.append({"id": sample_id, "message": str(exc)})
+            continue
+        difference_hash = 0
+        for row in range(8):
+            offset = row * 9
+            for column in range(8):
+                difference_hash = (difference_hash << 1) | int(
+                    pixels[offset + column] > pixels[offset + column + 1]
+                )
+        sample_hashes = sample.get("hashes")
+        image_hash = sample_hashes.get("image") if isinstance(sample_hashes, dict) else None
+        hashes[sample_id] = (difference_hash, image_hash if isinstance(image_hash, str) else "")
+
+    # With five disjoint bit blocks, any two 64-bit hashes within distance 4
+    # share at least one complete block. Bucketing limits comparisons on large
+    # datasets while preserving all matches under the configured threshold.
+    buckets: dict[tuple[int, int], list[str]] = {}
+    for sample_id, (value, _) in hashes.items():
+        for block_index, start in enumerate(range(0, 64, 13)):
+            width = min(13, 64 - start)
+            mask = (1 << width) - 1
+            block = (value >> start) & mask
+            buckets.setdefault((block_index, block), []).append(sample_id)
+
+    candidate_pairs: set[tuple[str, str]] = set()
+    for bucket_ids in buckets.values():
+        unique_ids = sorted(set(bucket_ids))
+        for index, left in enumerate(unique_ids):
+            for right in unique_ids[index + 1 :]:
+                if hashes[left][1] and hashes[left][1] == hashes[right][1]:
+                    continue
+                candidate_pairs.add((left, right))
+
+    pairs_by_component: dict[str, set[str]] = {}
+    matching_pairs: list[dict[str, Any]] = []
+    parent = {sample_id: sample_id for sample_id in hashes}
+
+    def find(sample_id: str) -> str:
+        while parent[sample_id] != sample_id:
+            parent[sample_id] = parent[parent[sample_id]]
+            sample_id = parent[sample_id]
+        return sample_id
+
+    for left, right in sorted(candidate_pairs):
+        distance = (hashes[left][0] ^ hashes[right][0]).bit_count()
+        if distance > max_hamming_distance:
+            continue
+        matching_pairs.append({"sample_ids": [left, right], "hamming_distance": distance})
+        left_root, right_root = find(left), find(right)
+        if left_root != right_root:
+            parent[max(left_root, right_root)] = min(left_root, right_root)
+
+    for pair in matching_pairs:
+        root = find(pair["sample_ids"][0])
+        pairs_by_component.setdefault(root, set()).update(pair["sample_ids"])
+    findings = []
+    for root, ids in sorted(pairs_by_component.items()):
+        pairs = [pair for pair in matching_pairs if find(pair["sample_ids"][0]) == root]
+        findings.append(
+            {
+                "type": "perceptual_duplicate_review",
+                "sample_ids": sorted(ids),
+                "pairs": pairs,
+                "max_hamming_distance": max_hamming_distance,
+            }
+        )
+    return findings, errors
+
+
 def check_dataset(data_dir: Path, layout: str = "auto") -> dict[str, Any]:
     """Inspect a dataset without writing crops or modifying its files."""
     data_dir = Path(data_dir).expanduser().resolve()
@@ -1134,6 +1306,32 @@ def check_dataset(data_dir: Path, layout: str = "auto") -> dict[str, Any]:
 
     duplicate_images = _duplicate_groups(duplicate_image_hashes)
     duplicate_references = _duplicate_groups(duplicate_reference_hashes)
+    document_overlaps = _split_overlap_findings(
+        samples, "source_document", "document_split_overlap"
+    )
+    writer_overlaps = _split_overlap_findings(samples, "writer_id", "writer_split_overlap")
+    for finding in document_overlaps:
+        _add_issue(
+            issues,
+            "document_split_overlap",
+            f"Source document {finding['source_document']!r} appears in multiple splits: "
+            f"{', '.join(finding['splits'])}",
+        )
+    perceptual_findings, perceptual_errors = _perceptual_duplicate_findings(samples)
+    for error in perceptual_errors:
+        _add_issue(
+            issues,
+            "perceptual_hash_error",
+            f"Cannot compute perceptual image hash: {error['message']}",
+            error["id"],
+        )
+    findings = (
+        [{"type": "duplicate_image_content", "ids": ids} for ids in duplicate_images]
+        + [{"type": "duplicate_reference_content", "ids": ids} for ids in duplicate_references]
+        + document_overlaps
+        + writer_overlaps
+        + perceptual_findings
+    )
     return {
         "valid": not issues,
         "layout": layout,
@@ -1143,13 +1341,13 @@ def check_dataset(data_dir: Path, layout: str = "auto") -> dict[str, Any]:
             "excluded": len(excluded),
             "images": image_count,
             "references": reference_count,
+            "findings": len(findings),
         },
         "samples": samples,
         "issues": issues,
         "excluded": excluded,
         "duplicate_content": {"images": duplicate_images, "references": duplicate_references},
-        "findings": [{"type": "duplicate_image_content", "ids": ids} for ids in duplicate_images]
-        + [{"type": "duplicate_reference_content", "ids": ids} for ids in duplicate_references],
+        "findings": findings,
     }
 
 
@@ -1159,23 +1357,43 @@ def split_dataset(
     validation: float = 0.15,
     test: float = 0.15,
     seed: int = 42,
+    protocol: str = "document-disjoint",
 ) -> list[dict[str, Any]]:
-    """Assign whole source documents to reproducible data splits.
+    """Assign reproducible document-disjoint or writer-disjoint data splits.
 
     Every sample must identify its source document in its top-level fields or
     metadata. Exact duplicate image bytes assigned to different documents are
-    rejected as potential leakage.
+    rejected as potential leakage. Writer-disjoint mode also requires writer
+    IDs and joins samples that share either a writer or source document, so a
+    multi-writer document and a writer's pages always stay in one split.
     """
+    if protocol not in {"document-disjoint", "writer-disjoint"}:
+        raise ValueError("protocol must be 'document-disjoint' or 'writer-disjoint'")
     ratios = {"train": train, "validation": validation, "test": test}
     if any(value < 0 for value in ratios.values()) or abs(sum(ratios.values()) - 1.0) > 1e-9:
         raise ValueError("train, validation, and test ratios must be non-negative and sum to 1")
-    groups: dict[str, list[dict[str, Any]]] = {}
+    sample_documents: dict[str, str] = {}
+    sample_writers: dict[str, str | None] = {}
+    document_groups: dict[str, list[dict[str, Any]]] = {}
     image_document: dict[str, str] = {}
     seen_ids: set[str] = set()
+    parent: dict[tuple[str, str], tuple[str, str]] = {}
+
+    def find(node: tuple[str, str]) -> tuple[str, str]:
+        parent.setdefault(node, node)
+        if parent[node] != node:
+            parent[node] = find(parent[node])
+        return parent[node]
+
+    def union(left: tuple[str, str], right: tuple[str, str]) -> None:
+        left_root, right_root = find(left), find(right)
+        if left_root != right_root:
+            parent[max(left_root, right_root)] = min(left_root, right_root)
+
     for sample in samples:
         sample_id = sample.get("id")
-        metadata = sample.get("metadata") or {}
-        document = sample.get("source_document") or metadata.get("source_document")
+        document = _sample_value(sample, "source_document")
+        writer = _sample_value(sample, "writer_id")
         if not isinstance(sample_id, str) or not sample_id:
             raise ValueError("Every sample needs a non-empty id")
         if sample_id in seen_ids:
@@ -1186,8 +1404,21 @@ def split_dataset(
                 f"Sample {sample_id!r} needs source_document metadata before document-level splitting"
             )
         document = document.strip()
-        groups.setdefault(document, []).append(sample)
-        image_hash = (sample.get("hashes") or {}).get("image")
+        sample_documents[sample_id] = document
+        writer_value = writer.strip() if isinstance(writer, str) and writer.strip() else None
+        if protocol == "writer-disjoint" and writer_value is None:
+            raise ValueError(
+                f"Sample {sample_id!r} needs writer_id metadata for writer-disjoint splitting"
+            )
+        sample_writers[sample_id] = writer_value
+        document_groups.setdefault(document, []).append(sample)
+        document_node = ("document", document)
+        find(document_node)
+        if protocol == "writer-disjoint":
+            writer_node = ("writer", writer_value)
+            union(document_node, writer_node)
+        hashes = sample.get("hashes")
+        image_hash = hashes.get("image") if isinstance(hashes, dict) else None
         if not image_hash:
             image_path = sample.get("image_path")
             if not isinstance(image_path, str) or not Path(image_path).is_file():
@@ -1202,55 +1433,77 @@ def split_dataset(
                     f"Duplicate image content crosses documents {previous_document!r} and {document!r}"
                 )
             image_document[image_hash] = document
-    if not groups:
+    if not document_groups:
         raise ValueError("Cannot split an empty dataset")
+    if protocol == "document-disjoint":
+        groups = document_groups
+        sample_group = {
+            sample["id"]: document for document, rows in groups.items() for sample in rows
+        }
+    else:
+        members: dict[tuple[str, str], set[tuple[str, str]]] = {}
+        for node in parent:
+            members.setdefault(find(node), set()).add(node)
+        canonical_groups = {root: tuple(sorted(nodes)) for root, nodes in members.items()}
+        sample_group = {}
+        for sample_id, document in sample_documents.items():
+            root = find(("document", document))
+            sample_group[sample_id] = canonical_groups[root]
+        groups: dict[tuple[tuple[str, str], ...], list[dict[str, Any]]] = {}
+        for sample in samples:
+            groups.setdefault(sample_group[sample["id"]], []).append(sample)
     if len(groups) < 3 and all(ratios[name] > 0 for name in ratios):
+        unit = (
+            "source documents"
+            if protocol == "document-disjoint"
+            else "independent writer/document groups"
+        )
         raise ValueError(
-            "At least three source documents are required for non-empty train/validation/test splits"
+            f"At least three {unit} are required for non-empty train/validation/test splits"
         )
     randomizer = random.Random(seed)
-    document_names = list(groups)
-    randomizer.shuffle(document_names)
+    group_names = sorted(groups)
+    randomizer.shuffle(group_names)
     tie_order = list(ratios)
     randomizer.shuffle(tie_order)
-    assigned: dict[str, str] = {}
+    assigned: dict[Any, str] = {}
     counts = {name: 0 for name in ratios}
     targets = {name: len(samples) * ratio for name, ratio in ratios.items()}
     # Seed each requested split once, then place larger remaining documents
     # where they reduce the distance from the target sample counts.
-    initial_documents = document_names[: len([name for name in ratios if ratios[name] > 0])]
-    for document, split_name in zip(
-        initial_documents, [name for name in tie_order if ratios[name] > 0], strict=True
+    initial_groups = group_names[: len([name for name in ratios if ratios[name] > 0])]
+    for group_key, split_name in zip(
+        initial_groups, [name for name in tie_order if ratios[name] > 0], strict=True
     ):
-        assigned[document] = split_name
-        counts[split_name] += len(groups[document])
-    remaining = document_names[len(initial_documents) :]
-    remaining.sort(key=lambda document: (-len(groups[document]), document))
-    for document in remaining:
+        assigned[group_key] = split_name
+        counts[split_name] += len(groups[group_key])
+    remaining = group_names[len(initial_groups) :]
+    remaining.sort(key=lambda group_key: (-len(groups[group_key]), group_key))
+    for group_key in remaining:
         split_name = max(
             (name for name in tie_order if ratios[name] > 0),
             key=lambda name: targets[name] - counts[name],
         )
-        assigned[document] = split_name
-        counts[split_name] += len(groups[document])
+        assigned[group_key] = split_name
+        counts[split_name] += len(groups[group_key])
     result = []
-    for document, group in groups.items():
-        for sample in group:
-            metadata = sample.get("metadata") or {}
-            result.append(
-                {
-                    "id": sample["id"],
-                    "source_document": document,
-                    "split": assigned[document],
-                    "writer_id": sample.get("writer_id", metadata.get("writer_id")),
-                    "content_type": sample.get("content_type", metadata.get("content_type")),
-                    "difficulty": sample.get("difficulty", metadata.get("difficulty")),
-                    "verification_status": sample.get(
-                        "verification_status", metadata.get("verification_status")
-                    ),
-                    "sample_type": sample.get("sample_type", metadata.get("sample_type")),
-                }
-            )
+    for sample in samples:
+        sample_id = sample["id"]
+        group_key = sample_group[sample_id]
+        result.append(
+            {
+                "id": sample_id,
+                "source_document": sample_documents[sample_id],
+                "split": assigned[group_key],
+                "writer_id": sample_writers[sample_id]
+                if sample_writers[sample_id] is not None
+                else _sample_value(sample, "writer_id"),
+                "content_type": _sample_value(sample, "content_type"),
+                "difficulty": _sample_value(sample, "difficulty"),
+                "verification_status": _sample_value(sample, "verification_status"),
+                "sample_type": _sample_value(sample, "sample_type"),
+            }
+        )
     return sorted(result, key=lambda record: record["id"])
 
 

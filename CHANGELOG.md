@@ -4,6 +4,11 @@ Notable changes to this project are recorded here.
 
 ## Unreleased
 
+- Add strict research eligibility checks, document/writer split protocols, and split-leakage audits with perceptual near-duplicate review findings.
+- Add error inspection HTML, subgroup reports, formula-rendering and annotation metrics, external prediction import, and reproducible OCR baseline examples.
+- Add versioned experiment suites with preview/resume, prompt and control variants, repetitions, and independent document-level reporting.
+- Add bounded transient retries, cloud concurrency, per-invocation request/spend limits, response caching, run status, and JSON CLI output.
+- Exclude cache hits from inference latency and observed provider usage/cost while retaining their predictions for accuracy and coverage.
 - Add portable, immutable benchmark snapshots and separate-run comparison reports.
 - Record benchmark fingerprints, scoring versions, dependency versions, and effective provider controls.
 - Validate experiment settings before inference and resolve configured paths relative to their TOML file.
