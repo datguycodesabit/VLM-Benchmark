@@ -93,7 +93,7 @@ def test_prepared_excludes_every_other_selection_setting(tmp_path, selection):
         'version=1\n[models."trocr:test"]\nnum_beams=0',
         'version=1\n[models."trocr:test"]\nnum_beams=11',
         'version=1\n[models."trocr:test"]\nnum_predict=true',
-        'version=1\n[models."trocr:test"]\ndevice="cuda"',
+        'version=1\n[models."trocr:test"]\ndevice="tpu"',
         'version=1\n[models."openai:test"]\nimage_detail="medium"',
         'version=1\n[models."openai:test"]\nreasoning_effort="fast"',
         "version=1\n[costs]\nvolumes=[0, 100]",
@@ -169,6 +169,19 @@ def test_validate_settings_allows_chatgpt_num_predict_while_recording_unsupporte
     }
 
 
+def test_local_device_selection_accepts_cuda_and_rocm_for_local_backends():
+    assert validate_settings(
+        ["trocr:handwritten", "python:adapter.module:Factory"],
+        {
+            "trocr:handwritten": {"device": "cuda"},
+            "python:adapter.module:Factory": {"device": "rocm", "num_predict": 128},
+        },
+    ) == {
+        "trocr:handwritten": {"device": "cuda"},
+        "python:adapter.module:Factory": {"device": "rocm", "num_predict": 128},
+    }
+
+
 def test_load_config_without_path_returns_empty_defaults():
     assert load_config(None) == {
         "version": 1,
@@ -231,6 +244,75 @@ def test_config_v2_resolves_suite_conditions_and_merges_model_settings(tmp_path)
     assert adapted["formula_rendering"] is True
     assert adapted["prose_prompt"] is None and adapted["math_prompt"] == "Read all symbols."
     assert adapted["settings"] == {"vision": {"temperature": 0.2, "seed": 0}}
+
+
+def test_config_v3_freezes_weighted_policy_measurement_and_three_pass_default(tmp_path):
+    path = tmp_path / "experiment.toml"
+    path.write_text(
+        'version=3\n[experiment]\nprepared="prepared/default"\n'
+        "[scoring]\ncharacter_accuracy_weight=0.65\nexact_match_weight=0.35\n"
+        "accuracy_margin_points=0.75\n"
+        '[measurement]\nprofile="latency"\n'
+        '[suite]\n[[suite.conditions]]\nname="baseline"\n'
+        'models=["ollama:vision"]\n'
+    )
+
+    config = load_config(path)
+
+    assert config["version"] == 3
+    assert config["scoring"] == {
+        "version": 1,
+        "character_accuracy_weight": 0.65,
+        "exact_match_weight": 0.35,
+        "accuracy_margin_points": 0.75,
+        "missing_and_failed_as_empty": True,
+        "pass_aggregation": "arithmetic_mean",
+        "normalization": "whitespace-v1",
+    }
+    assert config["measurement"] == {
+        "schema_version": 1,
+        "profile": "latency",
+        "concurrency": 1,
+        "batch_size": 1,
+        "cache_policy": "bypass",
+        "latency_boundary": "client_request_wall",
+    }
+    assert config["suite"]["conditions"][0]["repeats"] == 3
+
+
+@pytest.mark.parametrize(
+    "text, message",
+    [
+        (
+            "version=3\n[scoring]\ncharacter_accuracy_weight=0.6\nexact_match_weight=0.3",
+            "sum to 1",
+        ),
+        ("version=3\n[scoring]\nmissing_and_failed_as_empty=false", "must be true"),
+        ('version=3\n[scoring]\nnormalization="unicode-v2"', "normalization"),
+        ('version=3\n[measurement]\ncache_policy="allow"', "must be bypass"),
+        (
+            'version=3\n[measurement]\nprofile="latency"\nconcurrency=2',
+            "requires concurrency=1",
+        ),
+        ("version=3\n[measurement]\nbatch_size=0", "positive integer"),
+    ],
+)
+def test_config_v3_rejects_unfrozen_scoring_or_measurement_controls(tmp_path, text, message):
+    path = tmp_path / "experiment.toml"
+    path.write_text(text)
+
+    with pytest.raises(ValueError, match=message):
+        load_config(path)
+
+
+def test_config_v2_suite_default_is_three_passes(tmp_path):
+    path = tmp_path / "experiment.toml"
+    path.write_text(
+        'version=2\n[suite]\n[[suite.conditions]]\nname="baseline"\n'
+        'models=["ollama:vision"]\nprepared="prepared"\n'
+    )
+
+    assert load_config(path)["suite"]["conditions"][0]["repeats"] == 3
 
 
 @pytest.mark.parametrize(

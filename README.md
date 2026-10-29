@@ -1,5 +1,10 @@
 # VLM Bench
 
+For the three-pass weighted benchmark workflow, custom Python adapters, and offline
+HTML/Excel/CSV reports, see the [CLI guide](docs/CLI_GUIDE.md) and
+[update and validation report](docs/UPDATE_REPORT.md). The new policy evaluates
+prose and equations independently while preserving historical run metrics.
+
 VLM Bench compares handwriting recognition systems on the same images and
 verified references. It supports local Ollama vision models, TrOCR, eligible
 ChatGPT subscription models, and the OpenAI API. Results include transcription
@@ -276,6 +281,11 @@ excluded from those summaries. Reports expose cache-hit and measured-latency
 counts. The cache stores transcription responses at the selected local path.
 
 ## Development
+
+For implementation planning, read the [product specification](docs/PRODUCT_SPEC.md),
+the [architecture diagrams and agent implementation guide](docs/ARCHITECTURE.md),
+and the [implementation status](docs/IMPLEMENTATION_STATUS.md). The architecture
+guide distinguishes existing code from the proposed product design.
 
 ```bash
 uv sync --extra dev

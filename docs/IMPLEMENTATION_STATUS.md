@@ -59,3 +59,12 @@ Status: complete.
 - Spend caps are estimates applied per invocation, and concurrent in-flight requests may overshoot them. Strict validation on a prepared snapshot covers only its frozen samples and cannot establish source-wide train/validation leakage status.
 - Artifact readers remain backward-compatible with existing version-2 manifests; execution controls and protocol fields are additive, task metrics, `execution.json`, and cache entries use version 1, and experiment suites use TOML version 2.
 - Final packaging passed: offline build produced both wheel and source distribution, the final wheel installed in a fresh temporary environment, and `vlm-bench --json --help` worked outside the checkout. Archive inspection confirmed documentation, suite configuration, and OCR examples are in the source distribution; runtime modules are in the wheel; local data, runs, and environment files are excluded.
+
+## 2026-10-28 product architecture update
+
+The historical phase results above describe the earlier implementation. The new
+weighted policy, three-pass orchestration, device/custom-adapter layer, normalized
+timing evidence, conservative equivalence, init wizard, and shared offline reports
+are implemented. See [UPDATE_REPORT.md](UPDATE_REPORT.md) for all updates,
+423-test verification, the synthetic 1,000-image workflow, package checks, and
+explicit live-provider/hardware limits. See [CLI_GUIDE.md](CLI_GUIDE.md) for usage.

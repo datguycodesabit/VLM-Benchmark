@@ -59,6 +59,24 @@ _CONTENT_TYPES = {"prose", "equation", "word"}
 _PROTOCOLS = {"document-disjoint", "writer-disjoint"}
 _MAX_SEED = 2**32 - 1
 
+_DEFAULT_SCORING_POLICY = {
+    "version": 1,
+    "character_accuracy_weight": 0.70,
+    "exact_match_weight": 0.30,
+    "accuracy_margin_points": 0.5,
+    "missing_and_failed_as_empty": True,
+    "pass_aggregation": "arithmetic_mean",
+    "normalization": "whitespace-v1",
+}
+_DEFAULT_MEASUREMENT_PROFILE = {
+    "schema_version": 1,
+    "profile": "latency",
+    "concurrency": 1,
+    "batch_size": 1,
+    "cache_policy": "bypass",
+    "latency_boundary": "client_request_wall",
+}
+
 
 def _selector(value: Any, context: str) -> tuple[str, str]:
     if not isinstance(value, str) or not value.strip():
@@ -104,9 +122,10 @@ def _validate_model_settings(settings: Any, context: str) -> dict[str, Any]:
 
     result = dict(settings)
     if "device" in result and (
-        not isinstance(result["device"], str) or result["device"] not in {"auto", "cpu", "mps"}
+        not isinstance(result["device"], str)
+        or result["device"] not in {"auto", "cpu", "mps", "cuda", "rocm"}
     ):
-        raise ValueError(f"device for {context} must be one of auto, cpu, or mps")
+        raise ValueError(f"device for {context} must be one of auto, cpu, mps, cuda, or rocm")
     if "revision" in result and (
         not isinstance(result["revision"], str) or not result["revision"].strip()
     ):
@@ -184,6 +203,8 @@ def validate_settings(
                 "temperature",
                 "seed",
             }
+        elif provider == "python":
+            inapplicable = set()
         elif provider in {"openai", "chatgpt"}:
             inapplicable = set(canonical_options) & {
                 "device",
@@ -359,6 +380,109 @@ def _validate_costs(costs: Any) -> dict[str, Any]:
     return result
 
 
+def _finite_number(value: Any, name: str, *, minimum: float = 0.0) -> float:
+    try:
+        finite = math.isfinite(value)
+    except (TypeError, OverflowError):
+        finite = False
+    if (
+        isinstance(value, bool)
+        or not isinstance(value, (int, float))
+        or not finite
+        or value < minimum
+    ):
+        raise ValueError(f"{name} must be a finite number greater than or equal to {minimum}")
+    return float(value)
+
+
+def _validate_scoring(scoring: Any) -> dict[str, Any]:
+    """Validate and normalize a new, explicitly versioned scoring policy."""
+    if not isinstance(scoring, Mapping):
+        raise ValueError("scoring must be a table")
+    allowed = set(_DEFAULT_SCORING_POLICY)
+    unknown = set(scoring) - allowed
+    if unknown:
+        raise ValueError("Unknown scoring option: " + ", ".join(sorted(unknown)))
+    result = dict(_DEFAULT_SCORING_POLICY)
+    result.update(scoring)
+    if (
+        isinstance(result["version"], bool)
+        or not isinstance(result["version"], int)
+        or result["version"] != 1
+    ):
+        raise ValueError("scoring.version must be 1")
+    character_weight = _finite_number(
+        result["character_accuracy_weight"], "scoring.character_accuracy_weight"
+    )
+    exact_weight = _finite_number(result["exact_match_weight"], "scoring.exact_match_weight")
+    if (
+        character_weight > 1
+        or exact_weight > 1
+        or not math.isclose(character_weight + exact_weight, 1.0, rel_tol=0.0, abs_tol=1e-9)
+    ):
+        raise ValueError("scoring weights must be between 0 and 1 and sum to 1")
+    margin = _finite_number(result["accuracy_margin_points"], "scoring.accuracy_margin_points")
+    if margin > 100:
+        raise ValueError("scoring.accuracy_margin_points must be at most 100")
+    if result["missing_and_failed_as_empty"] is not True:
+        raise ValueError("scoring.missing_and_failed_as_empty must be true")
+    if result["pass_aggregation"] != "arithmetic_mean":
+        raise ValueError("scoring.pass_aggregation must be arithmetic_mean")
+    if result["normalization"] != "whitespace-v1":
+        raise ValueError("scoring.normalization must be whitespace-v1")
+    return {
+        "version": 1,
+        "character_accuracy_weight": character_weight,
+        "exact_match_weight": exact_weight,
+        "accuracy_margin_points": margin,
+        "missing_and_failed_as_empty": True,
+        "pass_aggregation": "arithmetic_mean",
+        "normalization": "whitespace-v1",
+    }
+
+
+def _validate_measurement(measurement: Any) -> dict[str, Any]:
+    """Normalize the measured-work profile frozen into a new run."""
+    if not isinstance(measurement, Mapping):
+        raise ValueError("measurement must be a table")
+    allowed = {
+        "profile",
+        "concurrency",
+        "batch_size",
+        "cache_policy",
+        "latency_boundary",
+    }
+    unknown = set(measurement) - allowed
+    if unknown:
+        raise ValueError("Unknown measurement option: " + ", ".join(sorted(unknown)))
+    result = dict(_DEFAULT_MEASUREMENT_PROFILE)
+    result.update(measurement)
+    profile = result["profile"]
+    if not isinstance(profile, str) or profile not in {"latency", "throughput"}:
+        raise ValueError("measurement.profile must be latency or throughput")
+    expected_boundary = "client_request_wall" if profile == "latency" else "workload_wall"
+    if "latency_boundary" not in measurement:
+        result["latency_boundary"] = expected_boundary
+    _positive_integer(result["concurrency"], "measurement.concurrency")
+    _positive_integer(result["batch_size"], "measurement.batch_size")
+    if profile == "latency" and (result["concurrency"] != 1 or result["batch_size"] != 1):
+        raise ValueError("latency measurement requires concurrency=1 and batch_size=1")
+    if result["cache_policy"] != "bypass":
+        raise ValueError("measurement.cache_policy must be bypass")
+    if result["latency_boundary"] != expected_boundary:
+        raise ValueError(
+            f"measurement.latency_boundary must be {expected_boundary} for {profile} profile"
+        )
+    return {
+        "schema_version": 1,
+        "profile": profile,
+        "concurrency": result["concurrency"],
+        "batch_size": result["batch_size"],
+        "cache_policy": "bypass",
+        "latency_boundary": expected_boundary,
+    }
+
+
 def _optional_prompt(condition: Mapping[str, Any], name: str) -> str | None:
     if name not in condition:
         return None
@@ -387,6 +511,8 @@ def _validate_suite(
     experiment: Mapping[str, Any],
     global_settings: Mapping[str, Any],
     base: Path,
+    *,
+    default_repeats: int = 1,
 ) -> dict[str, Any]:
     if not isinstance(suite, Mapping):
         raise ValueError("version = 2 requires a [suite] table")
@@ -415,7 +541,7 @@ def _validate_suite(
             "Each suite condition must define its own models; remove experiment.models"
         )
 
-    suite_repeats = suite.get("repeats", 1)
+    suite_repeats = suite.get("repeats", default_repeats)
     _positive_integer(suite_repeats, "suite.repeats")
     conditions = suite.get("conditions")
     if not isinstance(conditions, list) or not conditions:
@@ -539,13 +665,15 @@ def load_config(path: Path | None) -> dict[str, Any]:
     if (
         not isinstance(value.get("version"), int)
         or isinstance(value.get("version"), bool)
-        or value["version"] not in {1, 2}
+        or value["version"] not in {1, 2, 3}
     ):
-        raise ValueError("Experiment config requires version = 1 or 2")
+        raise ValueError("Experiment config requires version = 1, 2, or 3")
     config_version = value["version"]
     allowed_sections = {"version", "experiment", "models", "costs"}
-    if config_version == 2:
+    if config_version in {2, 3}:
         allowed_sections.add("suite")
+    if config_version == 3:
+        allowed_sections.update({"scoring", "measurement"})
     if set(value) - allowed_sections:
         raise ValueError("Unknown experiment config section")
 
@@ -574,6 +702,15 @@ def load_config(path: Path | None) -> dict[str, Any]:
         "models": validated_models,
         "costs": costs,
     }
-    if config_version == 2:
-        result["suite"] = _validate_suite(value.get("suite"), experiment, validated_models, base)
+    if config_version == 2 or (config_version == 3 and "suite" in value):
+        result["suite"] = _validate_suite(
+            value.get("suite"),
+            experiment,
+            validated_models,
+            base,
+            default_repeats=3,
+        )
+    if config_version == 3:
+        result["scoring"] = _validate_scoring(value.get("scoring", {}))
+        result["measurement"] = _validate_measurement(value.get("measurement", {}))
     return result

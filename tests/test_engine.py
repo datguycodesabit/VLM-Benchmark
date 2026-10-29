@@ -136,6 +136,228 @@ def test_dry_run_never_transcribes(paired):
     assert Backend.calls == []
 
 
+def test_new_policy_and_measurement_profile_are_frozen_for_resume(paired, tmp_path):
+    from vlm_bench.scoring_policy import ScoringPolicy
+
+    scoring = ScoringPolicy(
+        character_accuracy_weight=0.6,
+        exact_match_weight=0.4,
+        accuracy_margin_points=0.75,
+    ).to_dict()
+    measurement = {
+        "profile": "latency",
+        "concurrency": 1,
+        "batch_size": 1,
+        "cache_policy": "bypass",
+        "latency_boundary": "client_request_wall",
+    }
+    directory = engine.run(
+        paired,
+        ["ollama:first"],
+        tmp_path / "runs",
+        warmup=False,
+        suite_condition="baseline",
+        repetition=1,
+        repeated_measurement=True,
+        planned_passes=3,
+        scoring_policy=scoring,
+        measurement_profile=measurement,
+        backend_factory=Backend,
+    )
+
+    manifest = json.loads((directory / "manifest.json").read_text())
+    assert manifest["scoring_version"] == "1"  # Legacy CER rows keep their original scorer.
+    assert manifest["evaluation_schema_version"] == 2
+    assert manifest["scoring_policy"] == scoring
+    assert manifest["measurement_schema_version"] == 1
+    assert manifest["measurement_profile"]["profile"] == "latency"
+    assert manifest["planned_passes"] == 3
+    with pytest.raises(ValueError, match="Run manifest changed"):
+        manifest["scoring_policy"]["accuracy_margin_points"] = 1.0
+        (directory / "manifest.json").write_text(json.dumps(manifest))
+        engine.resume(directory, backend_factory=Backend)
+
+
+def test_latency_profile_bypasses_response_cache_even_for_single_pass(paired, tmp_path):
+    cache_dir = tmp_path / "cache"
+    engine.run(
+        paired,
+        ["ollama:first"],
+        tmp_path / "seed-run",
+        warmup=False,
+        cache_dir=cache_dir,
+        backend_factory=Backend,
+    )
+    calls_before = len(Backend.calls)
+    directory = engine.run(
+        paired,
+        ["ollama:first"],
+        tmp_path / "measured-run",
+        warmup=False,
+        cache_dir=cache_dir,
+        measurement_profile={"profile": "latency", "concurrency": 1, "batch_size": 1},
+        backend_factory=Backend,
+    )
+
+    rows = read_records(directory / "results.jsonl")
+    assert len(Backend.calls) - calls_before == 3
+    assert all(not row.get("cache_hit") for row in rows)
+    assert all(row["cache_bypass_reason"] == "latency_profile" for row in rows)
+
+
+def test_throughput_profile_records_wall_clock_denominator(paired, tmp_path):
+    directory = engine.run(
+        paired,
+        ["openai:first"],
+        tmp_path / "runs",
+        warmup=False,
+        measurement_profile={"profile": "throughput", "concurrency": 1},
+        backend_factory=Backend,
+    )
+
+    execution = json.loads((directory / "execution.json").read_text())
+    invocation = execution["invocations"][-1]
+    assert invocation["measurement_profile"]["profile"] == "throughput"
+    assert invocation["workload_wall_seconds"] > 0
+    assert invocation["workload_wall_seconds_cumulative"] == invocation["workload_wall_seconds"]
+    assert invocation["successful_sample_count"] == 3
+    assert invocation["throughput_numerator"] == "successful_uncached_sample_results"
+    assert invocation["throughput_denominator"] == "workload_wall_seconds_cumulative"
+    assert invocation["successful_samples_per_second"] > 0
+
+
+def test_resumed_throughput_uses_cumulative_workload_duration(paired, tmp_path):
+    directory = engine.run(
+        paired,
+        ["openai:first"],
+        tmp_path / "runs",
+        warmup=False,
+        max_requests=1,
+        measurement_profile={"profile": "throughput", "concurrency": 1},
+        backend_factory=Backend,
+    )
+    engine.resume(directory, max_requests=4, backend_factory=Backend)
+
+    execution = json.loads((directory / "execution.json").read_text())
+    previous, latest = execution["invocations"]
+    assert previous["status"] == "paused"
+    assert latest["successful_sample_count"] == 3
+    assert latest["workload_wall_seconds_cumulative"] == pytest.approx(
+        previous["workload_wall_seconds"] + latest["workload_wall_seconds"]
+    )
+    assert latest["throughput_denominator"] == "workload_wall_seconds_cumulative"
+    assert latest["successful_samples_per_second"] == pytest.approx(
+        3 / latest["workload_wall_seconds_cumulative"]
+    )
+
+
+def test_adapter_capability_rejection_happens_before_inference(paired, tmp_path):
+    from vlm_bench.adapters import BackendCapabilities
+
+    class EquationOnlyBackend(Backend):
+        capabilities = BackendCapabilities(supported_tracks=frozenset({"equation"}))
+
+    with pytest.raises(ValueError, match="no supported samples"):
+        engine.run(
+            paired,
+            ["ollama:first"],
+            tmp_path / "runs",
+            warmup=False,
+            backend_factory=EquationOnlyBackend,
+        )
+
+    assert EquationOnlyBackend.calls == []
+    assert not (tmp_path / "runs").exists()
+
+
+def test_experiment_resume_creates_remaining_passes_from_frozen_inputs(paired, tmp_path):
+    from vlm_bench import experiments
+
+    experiment_dir = tmp_path / "experiment"
+    first = engine.run(
+        paired,
+        ["ollama:first"],
+        experiment_dir / "runs",
+        warmup=False,
+        suite_condition="baseline",
+        repetition=1,
+        repeated_measurement=True,
+        planned_passes=2,
+        backend_factory=Backend,
+    )
+    state_path = experiment_dir / "experiment.json"
+    state_path.write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "planned_passes": 2,
+                "runs": [str(first.relative_to(experiment_dir))],
+            }
+        )
+    )
+
+    result = experiments.resume_experiment(
+        experiment_dir,
+        backend_factory=Backend,
+        progress=lambda _message: None,
+    )
+
+    state = json.loads(state_path.read_text())
+    assert result == experiment_dir.resolve()
+    assert state["status"] == "complete"
+    assert len(state["runs"]) == 2
+    assert all(not Path(value).is_absolute() for value in state["runs"])
+    first_manifest = json.loads((first / "manifest.json").read_text())
+    second = experiment_dir / state["runs"][1]
+    second_manifest = json.loads((second / "manifest.json").read_text())
+    assert second_manifest["repetition"] == 2
+    assert second_manifest["benchmark_fingerprint"] == first_manifest["benchmark_fingerprint"]
+    assert second_manifest["samples"]
+    assert (experiment_dir / "prepared-inputs" / "dataset-manifest.json").is_file()
+
+
+def test_experiment_resume_rebases_relative_paths_after_move(paired, tmp_path):
+    import shutil
+
+    from vlm_bench import experiments
+
+    original = tmp_path / "experiment"
+    first = engine.run(
+        paired,
+        ["ollama:first"],
+        original / "runs",
+        warmup=False,
+        suite_condition="baseline",
+        repetition=1,
+        repeated_measurement=True,
+        planned_passes=2,
+        backend_factory=Backend,
+    )
+    (original / "experiment.json").write_text(
+        json.dumps(
+            {
+                "schema_version": 1,
+                "planned_passes": 2,
+                "runs": [str(first.relative_to(original))],
+            }
+        )
+    )
+    moved = tmp_path / "moved-experiment"
+    shutil.move(original, moved)
+
+    experiments.resume_experiment(
+        moved,
+        backend_factory=Backend,
+        progress=lambda _message: None,
+    )
+
+    state = json.loads((moved / "experiment.json").read_text())
+    assert len(state["runs"]) == 2
+    rebased_first = moved / state["runs"][0]
+    manifest = json.loads((rebased_first / "manifest.json").read_text())
+    assert all(Path(sample["crop_path"]).is_file() for sample in manifest["samples"])
+
+
 def test_strict_source_run_uses_test_split_and_persists_audit(paired, tmp_path):
     metadata = [
         {

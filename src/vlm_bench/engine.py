@@ -45,7 +45,20 @@ def _parse(selector):
 def _identity(info):
     return {
         key: info.get(key)
-        for key in ("digest", "revision", "checkpoint_sha256", "model", "device", "version")
+        for key in (
+            "digest",
+            "revision",
+            "checkpoint_sha256",
+            "model",
+            "device",
+            "requested_device",
+            "runtime_identity",
+            "adapter_sha256",
+            "adapter_module",
+            "adapter_factory",
+            "adapter_version",
+            "version",
+        )
     }
 
 
@@ -57,7 +70,115 @@ def _eligible(provider, sample):
     ) != "page"
 
 
+def _sample_track(sample):
+    content_type = sample.get("content_type") or (sample.get("metadata") or {}).get("content_type")
+    return "equation" if content_type in {"equation", "math"} else "prose"
+
+
+def _measurement_profile(value, *, concurrency=1):
+    from .config import _validate_measurement
+
+    if value is None:
+        return None
+    if isinstance(value, dict) and "schema_version" in value:
+        if value["schema_version"] != 1 or isinstance(value["schema_version"], bool):
+            raise ValueError(f"Unsupported measurement schema version: {value['schema_version']!r}")
+        value = {key: item for key, item in value.items() if key != "schema_version"}
+    result = _validate_measurement(value)
+    if result["concurrency"] != concurrency:
+        raise ValueError(
+            "measurement_profile.concurrency must match the execution concurrency control"
+        )
+    if result["batch_size"] != 1:
+        raise ValueError("Batch sizes above 1 are not yet supported by the execution engine")
+    return result
+
+
+def _scoring_policy(value):
+    if value is None:
+        return None
+    from .scoring_policy import ScoringPolicy
+
+    try:
+        serializer = getattr(value, "to_dict", None)
+        normalized = serializer() if callable(serializer) else value
+        policy = ScoringPolicy.from_dict(normalized)
+        if not policy.missing_and_failed_as_empty:
+            raise ValueError("missing_and_failed_as_empty must be true")
+        return policy
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid scoring policy: {exc}") from exc
+
+
+def _capability_summary(backend, provider):
+    capabilities = getattr(backend, "capabilities", None)
+    if capabilities is None:
+        # Preserve third-party/legacy backends that predate the capability API.
+        return {
+            "supported_tracks": None,
+            "supported_sample_types": None,
+            "batching": False,
+            "streaming": False,
+            "concurrency_safe": provider in {"openai", "chatgpt"},
+            "timing_hooks": [],
+            "usage_fields": [],
+        }, None
+    serializer = getattr(capabilities, "to_dict", None)
+    if not callable(serializer):
+        raise ValueError(f"Backend {provider!r} capabilities must provide to_dict()")
+    summary = serializer()
+    if not isinstance(summary, dict):
+        raise ValueError(f"Backend {provider!r} capabilities must serialize to an object")
+    return summary, capabilities
+
+
+def _capability_supports(capabilities, summary, provider, sample):
+    track = _sample_track(sample)
+    sample_type = sample.get("sample_type") or "line"
+    if capabilities is not None:
+        supports = getattr(capabilities, "supports", None)
+        if callable(supports):
+            return bool(supports(track, sample_type))
+    tracks = summary.get("supported_tracks")
+    sample_types = summary.get("supported_sample_types")
+    supported = tracks is None or track in tracks
+    supported = supported and (sample_types is None or sample_type in sample_types)
+    if capabilities is None and provider == "trocr":
+        supported = supported and _eligible(provider, sample)
+    return supported
+
+
+def _validate_model_measurements(
+    provider,
+    selector,
+    samples,
+    capabilities,
+    capability_summary,
+    measurement_profile,
+    concurrency,
+):
+    unsupported = [
+        sample["id"]
+        for sample in samples
+        if not _capability_supports(capabilities, capability_summary, provider, sample)
+    ]
+    if unsupported and not any(
+        _capability_supports(capabilities, capability_summary, provider, sample)
+        for sample in samples
+    ):
+        raise ValueError(
+            f"Model {selector!r} has no supported samples in the frozen benchmark; "
+            f"unsupported sample IDs: {', '.join(map(str, unsupported[:5]))}"
+        )
+    if measurement_profile["batch_size"] > 1 and not capability_summary.get("batching"):
+        raise ValueError(f"Model {selector!r} does not support the requested batch size")
+    if concurrency > 1 and not capability_summary.get("concurrency_safe"):
+        raise ValueError(f"Model {selector!r} does not support concurrent requests")
+    return unsupported
+
+
 SCORING_VERSION = "1"
+EVALUATION_SCHEMA_VERSION = 2
 TASK_METRICS_VERSION = 1
 RESEARCH_PROTOCOL_VERSION = 1
 PROMPT_VERSION = 1
@@ -188,8 +309,6 @@ def _execution_controls(
         max_requests=max_requests,
         max_spend_usd=max_spend_usd,
     )
-    if concurrency > 1 and any(provider not in {"openai", "chatgpt"} for provider, _ in parsed):
-        raise ValueError("concurrency greater than 1 is supported only for cloud providers")
     costs = costs if isinstance(costs, dict) else {}
     if max_spend_usd is not None:
         ledger = SpendLedger(max_spend_usd)
@@ -353,6 +472,7 @@ def _controls(provider, options, settings, info):
         "trocr": {"num_predict", "num_beams", "device", "revision"},
         "openai": {"num_predict", "image_detail", "reasoning_effort"},
         "chatgpt": {"image_detail", "reasoning_effort"},
+        "python": set(requested),
     }[provider]
     effective = {k: v for k, v in requested.items() if k in supported}
     if provider == "trocr":
@@ -367,6 +487,10 @@ def _controls(provider, options, settings, info):
         effective.setdefault("image_detail", "auto")
         if provider == "openai":
             effective["max_output_tokens"] = effective.pop("num_predict")
+    elif provider == "python":
+        effective = {
+            key: value for key, value in requested.items() if not key.startswith("_vlm_bench_")
+        }
     return {
         "requested": requested,
         "effective": effective,
@@ -448,12 +572,23 @@ def preview(
     suite_condition=None,
     repetition=None,
     repeated_measurement=False,
+    scoring_policy=None,
+    measurement_profile=None,
+    planned_passes=1,
     backend_factory=_factory,
 ):
     _validate_research_options(strict_research, protocol)
     _validate_formula_rendering(formula_rendering)
     _validate_suite_metadata(suite_condition, repetition, repeated_measurement)
+    if (
+        isinstance(planned_passes, bool)
+        or not isinstance(planned_passes, int)
+        or planned_passes <= 0
+    ):
+        raise ValueError("planned_passes must be a positive integer")
     prose_prompt, math_prompt = _resolve_prompts(prose_prompt, math_prompt)
+    scoring = _scoring_policy(scoring_policy)
+    measurement = _measurement_profile(measurement_profile, concurrency=concurrency)
     parsed, settings = _validate(
         models, settings, timeout=timeout, num_predict=num_predict, seed=seed
     )
@@ -492,20 +627,29 @@ def preview(
             configured = (settings or {}).get(selector, {})
             with backend_factory(provider, base_url, timeout, configured) as backend:
                 info = backend.validate_model(name)
+                capability_summary, capabilities = _capability_summary(backend, provider)
+            unsupported_sample_ids = _validate_model_measurements(
+                provider,
+                selector,
+                samples,
+                capabilities,
+                capability_summary,
+                measurement or {"batch_size": 1},
+                concurrency,
+            )
             choices.append(
                 {
                     "selector": selector,
                     "provider": provider,
                     "execution": "cloud" if provider in {"openai", "chatgpt"} else "local",
                     "model_info": info,
+                    "capabilities": capability_summary,
                     "controls": _controls(provider, options, configured, info),
-                    "eligible_samples": sum(_eligible(provider, s) for s in samples),
-                    "unsupported_sample_ids": [
-                        s["id"] for s in samples if not _eligible(provider, s)
-                    ],
+                    "eligible_samples": len(samples) - len(unsupported_sample_ids),
+                    "unsupported_sample_ids": unsupported_sample_ids,
                 }
             )
-        return {
+        report = {
             "sample_count": len(samples),
             "sample_ids": [s["id"] for s in samples],
             "benchmark_fingerprint": snapshot["benchmark_fingerprint"],
@@ -520,6 +664,7 @@ def preview(
             "layout": snapshot["layout"],
             "preprocess": snapshot["preprocess"],
             "scoring_version": SCORING_VERSION,
+            "planned_passes": planned_passes,
             "research_protocol_version": RESEARCH_PROTOCOL_VERSION,
             "strict_research": strict_research,
             "protocol": protocol,
@@ -553,6 +698,13 @@ def preview(
             "inference": False,
             "determinism_note": "The sampling seed freezes selection; it does not guarantee identical model predictions.",
         }
+        if scoring is not None:
+            report["evaluation_schema_version"] = EVALUATION_SCHEMA_VERSION
+            report["scoring_policy"] = scoring.to_dict()
+        if measurement is not None:
+            report["measurement_schema_version"] = measurement["schema_version"]
+            report["measurement_profile"] = measurement
+        return report
 
 
 def run(
@@ -586,6 +738,12 @@ def run(
     suite_condition=None,
     repetition=None,
     repeated_measurement=False,
+    scoring_policy=None,
+    measurement_profile=None,
+    planned_passes=1,
+    frozen_source_audit=None,
+    frozen_validation_scope=None,
+    invocation_controls=None,
     backend_factory=_factory,
     progress=print,
 ):
@@ -594,7 +752,15 @@ def run(
     _validate_research_options(strict_research, protocol)
     _validate_formula_rendering(formula_rendering)
     _validate_suite_metadata(suite_condition, repetition, repeated_measurement)
+    if (
+        isinstance(planned_passes, bool)
+        or not isinstance(planned_passes, int)
+        or planned_passes <= 0
+    ):
+        raise ValueError("planned_passes must be a positive integer")
     prose_prompt, math_prompt = _resolve_prompts(prose_prompt, math_prompt)
+    scoring = _scoring_policy(scoring_policy)
+    measurement = _measurement_profile(measurement_profile, concurrency=concurrency)
     parsed, settings = _validate(
         models, settings, timeout=timeout, num_predict=num_predict, seed=seed
     )
@@ -608,6 +774,20 @@ def run(
         max_spend_usd=max_spend_usd,
         cache_dir=cache_dir,
     )
+    effective_invocation_controls = None
+    if invocation_controls is not None:
+        if not isinstance(invocation_controls, dict):
+            raise ValueError("invocation_controls must be a JSON object")
+        effective_invocation_controls = _execution_controls(
+            models,
+            parsed,
+            costs=costs,
+            max_retries=max_retries,
+            concurrency=concurrency,
+            max_requests=invocation_controls.get("max_requests", max_requests),
+            max_spend_usd=invocation_controls.get("max_spend_usd", max_spend_usd),
+            cache_dir=cache_dir,
+        )
     _validate_url(base_url)
     if not isinstance(warmup, bool):
         raise ValueError("Warmup must be a boolean")
@@ -616,6 +796,22 @@ def run(
     source_audit = (
         _audit_source(data_dir, layout, protocol) if strict_research and prepared is None else None
     )
+    if frozen_source_audit is not None:
+        if not isinstance(frozen_source_audit, dict):
+            raise ValueError("frozen_source_audit must be a JSON object")
+        source_audit = frozen_source_audit
+    default_validation_scope = (
+        "source-dataset-and-selected-test-samples"
+        if source_audit is not None and strict_research and prepared is None
+        else "source-dataset-and-selected-test-samples"
+        if source_audit is not None
+        else "prepared-snapshot-only"
+        if strict_research and prepared is not None
+        else "selected-samples-only"
+    )
+    validation_scope = frozen_validation_scope or default_validation_scope
+    if not isinstance(validation_scope, str) or not validation_scope:
+        raise ValueError("frozen_validation_scope must be a non-empty string")
     selected_split = "test" if strict_research and prepared is None and split is None else split
     selection = dict(
         layout=layout,
@@ -629,11 +825,24 @@ def run(
         research = _research_summary(snapshot["samples"], strict_research, protocol)
         formula_renderer = _preflight_formula_renderer(formula_rendering)
         info = {}
+        capabilities_by_selector = {}
+        unsupported_by_selector = {}
         for selector, (provider, name) in zip(models, parsed):
             with backend_factory(
                 provider, base_url, timeout, (settings or {}).get(selector, {})
             ) as backend:
                 info[selector] = backend.validate_model(name)
+                capability_summary, capabilities = _capability_summary(backend, provider)
+            unsupported_by_selector[selector] = _validate_model_measurements(
+                provider,
+                selector,
+                snapshot["samples"],
+                capabilities,
+                capability_summary,
+                measurement or {"batch_size": 1},
+                concurrency,
+            )
+            capabilities_by_selector[selector] = capability_summary
         directory = Path(output_dir).resolve() / (
             datetime.now().strftime("%Y%m%d-%H%M%S") + "-" + uuid.uuid4().hex[:8]
         )
@@ -648,8 +857,11 @@ def run(
                 "created_at": _now(),
                 "benchmark_fingerprint": copied["benchmark_fingerprint"],
                 "scoring_version": SCORING_VERSION,
+                "planned_passes": planned_passes,
                 "models": list(models),
                 "model_info": info,
+                "model_capabilities": capabilities_by_selector,
+                "unsupported_sample_ids": unsupported_by_selector,
                 "samples": samples,
                 "data_dir": str(Path(data_dir).resolve()) if data_dir is not None else None,
                 "prepared": str(Path(prepared).resolve()) if prepared is not None else None,
@@ -674,11 +886,7 @@ def run(
                     if strict_research and prepared is not None
                     else "Strict research source audit was not requested",
                 },
-                "validation_scope": "source-dataset-and-selected-test-samples"
-                if source_audit is not None
-                else "prepared-snapshot-only"
-                if strict_research and prepared is not None
-                else "selected-samples-only",
+                "validation_scope": validation_scope,
                 "content_type": copied.get("content_type"),
                 "limit": copied.get("limit"),
                 "seed": copied.get("seed", 42),
@@ -705,10 +913,22 @@ def run(
                 },
                 "host": _environment(),
             }
+            if scoring is not None:
+                manifest["evaluation_schema_version"] = EVALUATION_SCHEMA_VERSION
+                manifest["scoring_policy"] = scoring.to_dict()
+            if measurement is not None:
+                manifest["measurement_schema_version"] = measurement["schema_version"]
+                manifest["measurement_profile"] = measurement
             manifest["integrity"] = _digest(manifest)
             _atomic_json(directory / "manifest.json", manifest)
             progress(f"Run directory: {directory}")
-            return _execute(directory, manifest, backend_factory, progress)
+            return _execute(
+                directory,
+                manifest,
+                backend_factory,
+                progress,
+                invocation_controls=effective_invocation_controls,
+            )
 
 
 def resume(
@@ -735,6 +955,41 @@ def resume(
             )
         if manifest.get("scoring_version", SCORING_VERSION) != SCORING_VERSION:
             raise ValueError("Scoring rules changed; create a new run instead of mixing scores")
+        evaluation_schema = manifest.get("evaluation_schema_version")
+        if evaluation_schema is None and "scoring_policy" in manifest:
+            raise ValueError("Run manifest scoring_policy requires evaluation_schema_version")
+        if evaluation_schema is not None:
+            if evaluation_schema != EVALUATION_SCHEMA_VERSION or isinstance(
+                evaluation_schema, bool
+            ):
+                raise ValueError(f"Unsupported evaluation schema version: {evaluation_schema!r}")
+            if "scoring_policy" not in manifest:
+                raise ValueError("Versioned evaluation is missing its frozen scoring policy")
+            _scoring_policy(manifest["scoring_policy"])
+        measurement_schema = manifest.get("measurement_schema_version")
+        if measurement_schema is None and "measurement_profile" in manifest:
+            raise ValueError("Run manifest measurement_profile requires measurement_schema_version")
+        if measurement_schema is not None:
+            if measurement_schema != 1 or isinstance(measurement_schema, bool):
+                raise ValueError(f"Unsupported measurement schema version: {measurement_schema!r}")
+            frozen_measurement = manifest.get("measurement_profile")
+            if not isinstance(frozen_measurement, dict):
+                raise ValueError("Versioned measurement is missing its frozen profile")
+            canonical_measurement = _measurement_profile(
+                frozen_measurement,
+                concurrency=(manifest.get("execution_controls") or {}).get(
+                    "concurrency", manifest.get("concurrency", 1)
+                ),
+            )
+            if canonical_measurement != frozen_measurement:
+                raise ValueError("Saved measurement profile is not canonical")
+        planned_passes = manifest.get("planned_passes", 1)
+        if (
+            isinstance(planned_passes, bool)
+            or not isinstance(planned_passes, int)
+            or planned_passes <= 0
+        ):
+            raise ValueError("Run manifest planned_passes must be a positive integer")
         _validate_formula_rendering(manifest.get("formula_rendering", False))
         if manifest.get("task_metrics_version", TASK_METRICS_VERSION) != TASK_METRICS_VERSION:
             raise ValueError(
@@ -852,6 +1107,8 @@ def _execute(
         "estimated_soft_limit" if controls["max_spend_usd"] is not None else None,
     )
     state, invocation = _new_execution_state(directory, controls)
+    invocation["measurement_profile"] = manifest.get("measurement_profile")
+    invocation["planned_passes"] = manifest.get("planned_passes", 1)
     ledger = SpendLedger(controls["max_spend_usd"])
     cache = None
     if controls["cache_dir"] is not None:
@@ -985,6 +1242,12 @@ def _execute(
             cache_lookup_seconds=cache_lookup_seconds,
             cache_bypass_reason=cache_bypass_reason,
         )
+        provider_details = raw.get("provider_details")
+        if isinstance(provider_details, dict):
+            row["provider_details"] = provider_details
+            timing_observations = provider_details.get("timing_observations")
+            if isinstance(timing_observations, list):
+                row["timing_observations"] = timing_observations
         row.update(
             _response_timings(
                 raw, float("inf") if provider == "chatgpt" else manifest["options"]["num_predict"]
@@ -1022,10 +1285,17 @@ def _execute(
         return row
 
     def invoke(backend, name, sample, prompt, options):
+        request_options = options
+        if provider == "python":
+            request_options = dict(
+                options,
+                _vlm_bench_track=_sample_track(sample),
+                _vlm_bench_sample_type=sample.get("sample_type") or "line",
+            )
         method = getattr(backend, "transcribe_once", None)
         if callable(method):
-            return method(name, Path(sample["crop_path"]), prompt, options)
-        return backend.transcribe(name, Path(sample["crop_path"]), prompt, options)
+            return method(name, Path(sample["crop_path"]), prompt, request_options)
+        return backend.transcribe(name, Path(sample["crop_path"]), prompt, request_options)
 
     def invoke_timed(backend, name, sample, prompt, options):
         started = time.perf_counter()
@@ -1041,6 +1311,7 @@ def _execute(
     manifest["status"] = "running"
     _atomic_json(directory / "manifest.json", manifest)
     invocation_started = time.perf_counter()
+    measurement_started: float | None = None
     completed_this_invocation = [0]
     paused = False
     paused_providers = set()
@@ -1070,13 +1341,28 @@ def _execute(
                 current = backend.validate_model(name)
                 if _identity(current) != _identity(info):
                     raise ValueError(f"Model identity changed: {selector}; create a new run")
+                current_capabilities, capability_object = _capability_summary(backend, provider)
+                saved_capabilities = manifest.get("model_capabilities", {}).get(selector)
+                if saved_capabilities is not None and current_capabilities != saved_capabilities:
+                    raise ValueError(f"Model capabilities changed: {selector}; create a new run")
+                measurement = manifest.get("measurement_profile")
+                if measurement is not None:
+                    _validate_model_measurements(
+                        provider,
+                        selector,
+                        manifest["samples"],
+                        capability_object,
+                        current_capabilities,
+                        measurement,
+                        controls["concurrency"],
+                    )
                 options = dict(manifest["options"], **settings)
                 eligible = [sample for sample in pending if _eligible(provider, sample)]
 
                 if (
                     eligible
                     and manifest.get("warmup")
-                    and provider in {"ollama", "trocr"}
+                    and provider in {"ollama", "trocr", "python"}
                     and selector not in warmed_models
                 ):
                     warmup_sample = eligible[0]
@@ -1183,11 +1469,18 @@ def _execute(
                 queue = []
                 cache_info = manifest.get("provider_controls", {}).get(selector, {})
                 effective_controls = cache_info.get("effective", options)
+                unsupported_sample_ids = set(
+                    manifest.get("unsupported_sample_ids", {}).get(selector, [])
+                )
                 for sample in pending:
-                    if not _eligible(provider, sample):
+                    if sample["id"] in unsupported_sample_ids or (
+                        selector not in manifest.get("unsupported_sample_ids", {})
+                        and not _eligible(provider, sample)
+                    ):
                         row = base_row(selector, provider, sample)
                         row.update(
-                            status="unsupported", error="TrOCR requires a single prose-line image"
+                            status="unsupported",
+                            error=(f"{selector} does not support the frozen sample track or type"),
                         )
                         write_result(row)
                         continue
@@ -1195,16 +1488,21 @@ def _execute(
                     bypass_reason = None
                     lookup_seconds = None
                     if cache is not None:
-                        from .cache import cache_key
+                        profile = manifest.get("measurement_profile")
+                        if isinstance(profile, dict):
+                            key = None
+                            bypass_reason = f"{profile['profile']}_profile"
+                        else:
+                            from .cache import cache_key
 
-                        key, bypass_reason = cache_key(
-                            sample,
-                            selector,
-                            info,
-                            prompt,
-                            effective_controls,
-                            repeated_measurement=manifest.get("repeated_measurement", False),
-                        )
+                            key, bypass_reason = cache_key(
+                                sample,
+                                selector,
+                                info,
+                                prompt,
+                                effective_controls,
+                                repeated_measurement=manifest.get("repeated_measurement", False),
+                            )
                         if key is not None:
                             lookup_started = time.perf_counter()
                             cached = cache.lookup(key)
@@ -1236,6 +1534,9 @@ def _execute(
 
                 if not queue or selector_paused or invocation.get("limit_reason"):
                     continue
+                if measurement_started is None:
+                    # Start throughput timing after model setup and separate warmup work.
+                    measurement_started = time.perf_counter()
 
                 def finish_state(state_item, raw, error, elapsed, *, retry_allowed=True):
                     sample = state_item["sample"]
@@ -1517,7 +1818,15 @@ def _execute(
                     break
     except BaseException:
         manifest.update(status="interrupted", updated_at=_now())
-        invocation.update(status="interrupted", finished_at=_now())
+        invocation.update(
+            status="interrupted",
+            finished_at=_now(),
+            workload_wall_seconds=(
+                max(0.0, time.perf_counter() - measurement_started)
+                if measurement_started is not None
+                else 0.0
+            ),
+        )
         _atomic_json(directory / "manifest.json", manifest)
         persist_runtime()
         raise
@@ -1530,8 +1839,48 @@ def _execute(
         if all(row["status"] in {"success", "unsupported"} for row in rows)
         else "complete_with_errors"
     )
+    workload_wall_seconds = (
+        max(0.0, time.perf_counter() - measurement_started)
+        if measurement_started is not None
+        else 0.0
+    )
+    successful_samples = sum(
+        row.get("status") == "success" and row.get("cache_hit") is not True for row in rows
+    )
+    terminal_samples = sum(row.get("status") in {"success", "unsupported", "error"} for row in rows)
+    prior_workload_wall_seconds = sum(
+        duration
+        for prior in state["invocations"]
+        if prior is not invocation
+        and (duration := prior.get("workload_wall_seconds")) is not None
+        and isinstance(duration, (int, float))
+        and not isinstance(duration, bool)
+        and math.isfinite(duration)
+        and duration >= 0
+    )
+    cumulative_workload_wall_seconds = prior_workload_wall_seconds + workload_wall_seconds
+    invocation.update(
+        status=final_status,
+        finished_at=_now(),
+        workload_wall_seconds=workload_wall_seconds,
+        workload_wall_seconds_cumulative=cumulative_workload_wall_seconds,
+        successful_sample_count=successful_samples,
+        terminal_sample_count=terminal_samples,
+        successful_samples_per_second=(
+            successful_samples / cumulative_workload_wall_seconds
+            if cumulative_workload_wall_seconds > 0
+            else None
+        ),
+        terminal_samples_per_second=(
+            terminal_samples / cumulative_workload_wall_seconds
+            if cumulative_workload_wall_seconds > 0
+            else None
+        ),
+        throughput_numerator="successful_uncached_sample_results",
+        throughput_denominator="workload_wall_seconds_cumulative",
+        terminal_throughput_numerator="terminal_sample_results",
+    )
     manifest.update(status=final_status, updated_at=_now())
-    invocation.update(status=final_status, finished_at=_now())
     _atomic_json(directory / "manifest.json", manifest)
     persist_runtime()
     return directory

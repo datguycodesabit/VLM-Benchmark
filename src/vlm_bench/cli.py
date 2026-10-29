@@ -27,6 +27,11 @@ def parser():
         help="Emit one machine-readable JSON object; progress and human text go to stderr",
     )
     sub = root.add_subparsers(dest="command", required=True)
+    init = sub.add_parser("init", help="Generate an editable three-pass experiment configuration")
+    init.add_argument("--output", type=Path, default=Path("benchmark.toml"))
+    init.add_argument("--prepared", type=Path)
+    init.add_argument("--models", nargs="+")
+    init.add_argument("--repeats", type=_positive_int_argument, default=3)
     prepare = sub.add_parser(
         "prepare", help="Validate and freeze paired or IAM handwriting samples"
     )
@@ -60,6 +65,7 @@ def parser():
     run.add_argument("--no-warmup", action="store_true")
     run.add_argument("--dry-run", action="store_true")
     run.add_argument("--config", type=Path)
+    run.add_argument("--repeats", type=_positive_int_argument, default=None)
     run.add_argument(
         "--strict-research",
         action=argparse.BooleanOptionalAction,
@@ -127,7 +133,19 @@ def parser():
     report.add_argument(
         "--group-by",
         choices=["writer_id", "difficulty", "source_document", "sample_type"],
-        required=True,
+        required=False,
+    )
+    report.add_argument("--output", type=Path, help="Directory for the complete offline report")
+    report.add_argument(
+        "--weighted",
+        action="store_true",
+        help="Explicitly derive a default weighted evaluation for legacy evidence",
+    )
+    report.add_argument(
+        "--formats",
+        nargs="+",
+        choices=["html", "xlsx", "csv", "json"],
+        default=["html", "xlsx", "csv", "json"],
     )
     status = sub.add_parser(
         "status", help="Read progress, coverage, limits, and usage for a saved run"
@@ -283,6 +301,11 @@ def _report(run_dir):
                 )
         for output in export_run(run_dir, ["xlsx", "csv", "jsonl"]):
             print(f"Saved: {output}")
+        if manifest.get("scoring_policy"):
+            from .reporting import write_report
+
+            for output in write_report(run_dir):
+                print(f"Saved: {output}")
         return
     print(f"{'Model':<28} {'CER':>9} {'WER':>9} {'Exact':>9} {'p50 sec':>9}  Status")
     for summary in summarize(
@@ -494,7 +517,9 @@ def _json_cli(arguments):
         payload["suite_directory"] = str(args.output.resolve())
         suite_report = args.output / "suite-report.json"
         if not args.dry_run and suite_report.is_file():
-            payload["report_paths"] = [str(suite_report.resolve())]
+            payload["report_paths"] = list(
+                dict.fromkeys([str(suite_report.resolve()), *saved_paths])
+            )
             if exit_code == 0:
                 payload["result"] = json.loads(suite_report.read_text(encoding="utf-8"))
     elif args.command == "prepare":
@@ -547,6 +572,7 @@ def _json_cli(arguments):
 def _command_hint(arguments):
     known = {
         "prepare",
+        "init",
         "models",
         "run",
         "suite",
@@ -571,7 +597,24 @@ def main(argv=None):
         return _json_cli(arguments)
     args = parser().parse_args(arguments)
     try:
-        if args.command == "prepare":
+        if args.command == "init":
+            from .init import create_config
+
+            prepared = args.prepared
+            models = args.models
+            if prepared is None or not models:
+                if not sys.stdin.isatty():
+                    raise ValueError("Non-interactive init requires --prepared and --models")
+                if prepared is None:
+                    prepared = Path(input("Prepared snapshot directory: ").strip())
+                if not models:
+                    models = input("Model selectors (space-separated): ").split()
+            output = create_config(
+                args.output, prepared=prepared, models=models, repeats=args.repeats
+            )
+            print(f"Saved: {output}")
+            print(f"Run: vlm-bench suite --config {output} --output runs/benchmark")
+        elif args.command == "prepare":
             output = args.output or args.data / "prepared"
             from .snapshot import freeze
 
@@ -678,6 +721,33 @@ def main(argv=None):
             from .engine import preview, run
 
             config = load_config(args.config)
+            if config.get("suite"):
+                from .suite import run_suite
+
+                if args.models or args.repeats is not None:
+                    raise ValueError("Set models and repeats in the suite configuration")
+                result = run_suite(
+                    args.config,
+                    args.output,
+                    dry_run=args.dry_run,
+                    max_retries=args.max_retries,
+                    concurrency=args.concurrency,
+                    max_requests=args.max_requests,
+                    max_spend_usd=args.max_spend_usd,
+                    cache_dir=args.cache_dir,
+                )
+                print(json.dumps(result, ensure_ascii=False, indent=2, allow_nan=False))
+                if not args.dry_run:
+                    from .reporting import write_report
+
+                    for output in write_report(args.output):
+                        print(f"Saved: {output}")
+                return (
+                    0
+                    if args.dry_run
+                    or all(item["status"] == "complete" for item in result["conditions"].values())
+                    else 2
+                )
             experiment = config["experiment"]
             selected = args.models or experiment.get("models")
             if not selected:
@@ -773,6 +843,26 @@ def main(argv=None):
                 protocol=chosen("protocol", args.protocol, "document-disjoint"),
                 formula_rendering=chosen("formula_rendering", args.formula_rendering, False),
             )
+            repeats = args.repeats or (3 if args.config is None or config["version"] >= 3 else 1)
+            if args.config is None or config["version"] >= 3:
+                from .scoring_policy import ScoringPolicy
+
+                if (
+                    config.get("measurement")
+                    and "concurrency" not in experiment
+                    and not any(
+                        value == "--concurrency" or value.startswith("--concurrency=")
+                        for value in supplied
+                    )
+                ):
+                    options["concurrency"] = config["measurement"].get("concurrency", 1)
+                options["scoring_policy"] = config.get("scoring") or ScoringPolicy().to_dict()
+                options["measurement_profile"] = config.get("measurement") or {
+                    "profile": "latency" if options["concurrency"] == 1 else "throughput",
+                    "concurrency": options["concurrency"],
+                    "batch_size": 1,
+                }
+                options["planned_passes"] = repeats
             failed = False
             for profile in profiles:
                 if profile is not None:
@@ -787,23 +877,102 @@ def main(argv=None):
                         )
                     )
                     continue
-                run_dir = run(
-                    data,
-                    selected,
-                    args.output,
-                    warmup=not args.no_warmup and experiment.get("warmup", True),
-                    costs=config["costs"],
-                    **options,
-                )
-                print(f"Run: {run_dir}")
-                _report(run_dir)
-                failed |= any(
-                    r["status"] not in {"success", "unsupported"}
-                    for r in read_records(run_dir / "results.jsonl")
-                )
-                failed |= (
-                    json.loads((run_dir / "manifest.json").read_text()).get("status") == "paused"
-                )
+                from .runner import _atomic_json
+
+                experiment_dir = args.output
+                state = {"schema_version": 1, "planned_passes": repeats, "runs": []}
+                if repeats > 1:
+                    import tempfile
+
+                    args.output.mkdir(parents=True, exist_ok=True)
+                    experiment_dir = Path(tempfile.mkdtemp(prefix="experiment-", dir=args.output))
+                    _atomic_json(experiment_dir / "experiment.json", state)
+                frozen_options = dict(options)
+                pass_data = data
+                if repeats > 1 and frozen_options.get("prepared") is None:
+                    from .snapshot import freeze
+
+                    if frozen_options.get("strict_research"):
+                        from .engine import _audit_source
+
+                        frozen_options["frozen_source_audit"] = _audit_source(
+                            data, frozen_options.get("layout") or "auto", frozen_options["protocol"]
+                        )
+                        frozen_options["frozen_validation_scope"] = (
+                            "source-dataset-and-selected-test-samples"
+                        )
+
+                    snapshot_dir = experiment_dir / "prepared"
+                    selection_keys = (
+                        "layout",
+                        "preprocess",
+                        "split",
+                        "content_type",
+                        "limit",
+                        "seed",
+                    )
+                    freeze(
+                        data,
+                        snapshot_dir,
+                        **{
+                            key: frozen_options[key]
+                            for key in selection_keys
+                            if frozen_options.get(key) is not None
+                        },
+                    )
+                    for key in selection_keys:
+                        frozen_options.pop(key, None)
+                    frozen_options["prepared"] = snapshot_dir
+                    pass_data = None
+                for repetition in range(1, repeats + 1):
+                    pass_options = dict(frozen_options)
+                    if repeats > 1:
+                        pass_options.update(
+                            suite_condition="baseline",
+                            repetition=repetition,
+                            repeated_measurement=True,
+                            planned_passes=repeats,
+                        )
+
+                    def progress(message):
+                        print(message)
+                        if repeats > 1 and message.startswith("Run directory: "):
+                            path = str(
+                                Path(message.removeprefix("Run directory: "))
+                                .resolve()
+                                .relative_to(experiment_dir.resolve())
+                            )
+                            if path not in state["runs"]:
+                                state["runs"].append(path)
+                                _atomic_json(experiment_dir / "experiment.json", state)
+
+                    run_dir = run(
+                        pass_data,
+                        selected,
+                        experiment_dir,
+                        warmup=not args.no_warmup and experiment.get("warmup", True),
+                        costs=config["costs"],
+                        progress=progress,
+                        **pass_options,
+                    )
+                    print(f"Run: {run_dir}")
+                    _report(run_dir)
+                    failed |= any(
+                        r["status"] not in {"success", "unsupported"}
+                        for r in read_records(run_dir / "results.jsonl")
+                    )
+                    paused = (
+                        json.loads((run_dir / "manifest.json").read_text()).get("status")
+                        == "paused"
+                    )
+                    failed |= paused
+                    if paused:
+                        break
+                if repeats > 1:
+                    from .reporting import write_report
+
+                    for output in write_report(experiment_dir):
+                        print(f"Saved: {output}")
             return 2 if failed else 0
         elif args.command == "suite":
             from .suite import run_suite
@@ -821,6 +990,10 @@ def main(argv=None):
             )
             print(json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False))
             if not args.dry_run:
+                from .reporting import write_report
+
+                for output in write_report(args.output):
+                    print(f"Saved: {output}")
                 failed = any(
                     condition["status"] != "complete" for condition in report["conditions"].values()
                 )
@@ -866,10 +1039,22 @@ def main(argv=None):
                 )
             print(f"Saved inspection report: {output}")
         elif args.command == "report":
-            from .inspection import group_report
+            if args.group_by:
+                from .inspection import group_report
 
-            report = group_report(args.run, args.group_by)
-            print(json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False))
+                report = group_report(args.run, args.group_by)
+                print(json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False))
+            else:
+                from .reporting import write_report
+                from .scoring_policy import ScoringPolicy
+
+                for output in write_report(
+                    args.run,
+                    args.output,
+                    formats=args.formats,
+                    policy=ScoringPolicy() if args.weighted else None,
+                ):
+                    print(f"Saved: {output}")
         elif args.command == "compare":
             from .comparison import compare
 
@@ -896,6 +1081,32 @@ def main(argv=None):
                     )
             print(f"Saved comparison: {args.output.resolve()}")
         elif args.command == "resume":
+            if (args.run / "experiment.json").is_file():
+                from .experiments import resume_experiment
+                from .reporting import write_report
+
+                directory = resume_experiment(
+                    args.run,
+                    retry_failed=args.retry_failed,
+                    max_requests=args.max_requests,
+                    max_spend_usd=args.max_spend_usd,
+                )
+                for output in write_report(directory):
+                    print(f"Saved: {output}")
+                state = json.loads((directory / "experiment.json").read_text())
+                manifests = [
+                    json.loads((directory / path / "manifest.json").read_text())
+                    for path in state["runs"]
+                ]
+                return (
+                    0
+                    if len(manifests) == state["planned_passes"]
+                    and all(
+                        manifest.get("status") in {"complete", "complete_with_errors"}
+                        for manifest in manifests
+                    )
+                    else 2
+                )
             manifest = json.loads((args.run / "manifest.json").read_text())
             if manifest.get("schema_version", 1) == 2:
                 from .engine import resume as resume_new

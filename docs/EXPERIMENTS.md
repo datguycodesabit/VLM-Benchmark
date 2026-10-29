@@ -558,3 +558,23 @@ on standard error, leaving standard output parseable:
 uv run vlm-bench --json status --run runs/YOUR_RUN_DIRECTORY
 uv run vlm-bench --json report --run runs/YOUR_RUN_DIRECTORY --group-by writer_id
 ```
+
+## Version 3 weighted experiments and custom local adapters
+
+See [CLI_GUIDE.md](CLI_GUIDE.md) for the new three-pass workflow, scoring policy,
+latency/throughput profiles, and offline HTML/Excel/CSV reports. The full example
+[`examples/custom_adapter.py`](../examples/custom_adapter.py) implements the
+`python:module:Factory` lifecycle with a local PyTorch model. Replace its checkpoint
+and model-specific methods for your own architecture; pin a checkpoint revision
+in TOML and record weight hashes in the adapter identity when available.
+
+```toml
+[models."python:examples.custom_adapter:Factory"]
+device = "cpu"
+# revision = "YOUR_IMMUTABLE_CHECKPOINT_COMMIT"
+num_beams = 4
+```
+
+Run the example from the repository root or install your adapter module into the
+same Python environment as `vlm-bench`. Optional dependencies must be installed.
+The example requires model weights and has not been validated with live inference.

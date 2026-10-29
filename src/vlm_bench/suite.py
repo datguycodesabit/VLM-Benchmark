@@ -65,9 +65,13 @@ def _config_hash(path: Path) -> str:
 
 
 def _condition_kwargs(
-    condition: dict[str, Any], costs: dict[str, Any] | None = None
+    condition: dict[str, Any],
+    costs: dict[str, Any] | None = None,
+    *,
+    scoring_policy: dict[str, Any] | None = None,
+    measurement_profile: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    return {
+    values = {
         "prepared": Path(condition["prepared"]),
         "settings": condition.get("settings", {}),
         "strict_research": condition.get("strict_research", False),
@@ -78,12 +82,26 @@ def _condition_kwargs(
         "math_prompt": condition.get("math_prompt"),
         "costs": costs or {},
     }
+    if scoring_policy is not None:
+        values["scoring_policy"] = scoring_policy
+    if measurement_profile is not None:
+        values["measurement_profile"] = measurement_profile
+    return values
 
 
 def _preview_kwargs(
-    condition: dict[str, Any], costs: dict[str, Any] | None = None
+    condition: dict[str, Any],
+    costs: dict[str, Any] | None = None,
+    *,
+    scoring_policy: dict[str, Any] | None = None,
+    measurement_profile: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
-    values = _condition_kwargs(condition, costs)
+    values = _condition_kwargs(
+        condition,
+        costs,
+        scoring_policy=scoring_policy,
+        measurement_profile=measurement_profile,
+    )
     values.pop("warmup")
     return values
 
@@ -292,7 +310,7 @@ def _build_report(manifest: dict[str, Any], suite_root: Path) -> dict[str, Any]:
             "per_run": per_run,
             "variability": variability,
         }
-    return {
+    result = {
         "schema_version": 1,
         "suite_id": manifest["suite_id"],
         "config_sha256": manifest["config_sha256"],
@@ -305,6 +323,11 @@ def _build_report(manifest: dict[str, Any], suite_root: Path) -> dict[str, Any]:
         ),
         "comparisons": manifest.get("comparisons", []),
     }
+    if isinstance(manifest.get("scoring_policy"), dict):
+        from .report_model import build_report
+
+        result["weighted_evaluation"] = build_report(suite_root).get("conditions", {})
+    return result
 
 
 def _is_finite(value: Any) -> bool:
@@ -388,6 +411,19 @@ def _verify_run_identity(
         raise ValueError(f"Saved run settings do not match suite condition {name!r}")
     if run_manifest.get("prompt_hashes") != preview.get("prompt_hashes"):
         raise ValueError(f"Saved run prompts do not match suite condition {name!r}")
+    for field in (
+        "scoring_policy",
+        "measurement_profile",
+        "evaluation_schema_version",
+        "measurement_schema_version",
+    ):
+        if field in preview and run_manifest.get(field) != preview[field]:
+            raise ValueError(f"Saved run {field} does not match suite condition {name!r}")
+    if (
+        "planned_passes" in preview
+        and run_manifest.get("planned_passes", 1) != condition["repeats"]
+    ):
+        raise ValueError(f"Saved run planned_passes does not match suite condition {name!r}")
     for field in ("strict_research", "protocol", "formula_rendering", "warmup"):
         if run_manifest.get(field) != condition.get(field):
             raise ValueError(f"Saved run {field} does not match suite condition {name!r}")
@@ -520,8 +556,12 @@ def _run_suite_impl(
     config_digest = _config_hash(config_path)
     config = load_config(config_path)
     suite = config.get("suite")
-    if config.get("version") != 2 or not isinstance(suite, dict) or suite.get("version") != 2:
-        raise ValueError("suite requires an experiment config with version = 2")
+    if (
+        config.get("version") not in {2, 3}
+        or not isinstance(suite, dict)
+        or suite.get("version") != 2
+    ):
+        raise ValueError("suite requires an experiment config with version = 2 or 3")
     conditions = suite.get("conditions")
     if not isinstance(conditions, list) or not conditions:
         raise ValueError("Version-2 suite config must define at least one condition")
@@ -532,7 +572,14 @@ def _run_suite_impl(
         raise ValueError("Suite condition names must be unique")
     experiment = config.get("experiment", {})
     max_retries = max_retries if max_retries is not None else experiment.get("max_retries", 2)
-    concurrency = concurrency if concurrency is not None else experiment.get("concurrency", 1)
+    configured_measurement = config.get("measurement")
+    if isinstance(configured_measurement, dict):
+        configured_measurement = dict(configured_measurement)
+        if concurrency is not None:
+            configured_measurement["concurrency"] = concurrency
+        concurrency = configured_measurement.get("concurrency", 1)
+    else:
+        concurrency = concurrency if concurrency is not None else experiment.get("concurrency", 1)
     max_requests = max_requests if max_requests is not None else experiment.get("max_requests")
     max_spend_usd = max_spend_usd if max_spend_usd is not None else experiment.get("max_spend_usd")
     cache_dir = cache_dir if cache_dir is not None else experiment.get("cache_dir")
@@ -545,6 +592,7 @@ def _run_suite_impl(
         "max_requests": max_requests,
         "max_spend_usd": max_spend_usd,
         "cache_dir": str(Path(cache_dir).expanduser().resolve()) if cache_dir is not None else None,
+        "measurement_profile": configured_measurement,
     }
     preview_fn = preview_fn or engine_preview
     run_fn = run_fn or engine_run
@@ -578,7 +626,12 @@ def _run_suite_impl(
 
     previews: dict[str, dict[str, Any]] = {}
     for condition in conditions:
-        kwargs = _preview_kwargs(condition, config.get("costs"))
+        kwargs = _preview_kwargs(
+            condition,
+            config.get("costs"),
+            scoring_policy=config.get("scoring"),
+            measurement_profile=configured_measurement,
+        )
         kwargs.update(base_url=base_url, timeout=timeout, num_predict=num_predict)
         kwargs.update(
             max_retries=max_retries,
@@ -590,6 +643,7 @@ def _run_suite_impl(
         kwargs["suite_condition"] = condition["name"]
         kwargs["repetition"] = 1
         kwargs["repeated_measurement"] = condition["repeats"] > 1
+        kwargs["planned_passes"] = condition["repeats"]
         result = preview_fn(None, list(condition["models"]), **kwargs)
         if not isinstance(result, dict):
             raise ValueError(f"Engine preview returned an invalid result for {condition['name']!r}")
@@ -636,6 +690,8 @@ def _run_suite_impl(
             "config_path": str(config_path),
             "config_sha256": config_digest,
             "execution_controls": execution_controls,
+            "scoring_policy": _jsonable(config.get("scoring")),
+            "measurement_profile": _jsonable(configured_measurement),
             "normalized_suite": _jsonable(suite),
             "conditions": [
                 {
@@ -706,7 +762,12 @@ def _run_suite_impl(
                 }
                 manifest["runs"][key] = record
                 _write_suite_state(manifest_path, manifest)
-                kwargs = _condition_kwargs(condition, config.get("costs"))
+                kwargs = _condition_kwargs(
+                    condition,
+                    config.get("costs"),
+                    scoring_policy=config.get("scoring"),
+                    measurement_profile=configured_measurement,
+                )
                 kwargs.update(
                     base_url=base_url,
                     timeout=timeout,
@@ -719,6 +780,7 @@ def _run_suite_impl(
                     suite_condition=name,
                     repetition=repetition,
                     repeated_measurement=condition["repeats"] > 1,
+                    planned_passes=condition["repeats"],
                     progress=lambda message, n=name, r=repetition, d=None: _progress(
                         message, n, r, d, manifest, manifest_path, key, progress
                     ),

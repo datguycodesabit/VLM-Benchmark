@@ -4,6 +4,7 @@ recursive-include src *.py
 recursive-include tests *.py
 recursive-include docs *.md
 recursive-include examples *.toml *.py
+recursive-include scripts *.py
 prune data
 prune runs
 prune benchmarks

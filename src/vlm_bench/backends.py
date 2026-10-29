@@ -11,10 +11,12 @@ import base64
 import gc
 import hashlib
 import json
+import math
 import mimetypes
 import os
 import re
 import time
+from collections.abc import Mapping
 from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 from pathlib import Path
@@ -24,12 +26,25 @@ from urllib.parse import urlsplit
 import httpx
 
 from . import auth
+from .adapters import (
+    BackendCapabilities,
+    import_adapter_factory,
+    safe_adapter_identity,
+)
+from .devices import (
+    DeviceResolution,
+    memory_diagnostics,
+    resolve_device,
+    runtime_identity,
+    synchronize,
+)
 from .execution import RetryableProviderError
+from .measurement import normalize_timing_observations, timing_observation, unavailable_timing
 from .ollama import OllamaClient
 
 DEFAULT_TROCR_MODEL = "microsoft/trocr-base-handwritten"
 OPENAI_API_BASE = "https://api.openai.com/v1"
-_PROVIDERS = {"ollama", "trocr", "chatgpt", "openai"}
+_PROVIDERS = {"ollama", "trocr", "chatgpt", "openai", "python"}
 
 
 class BackendPaused(RuntimeError):
@@ -51,6 +66,7 @@ class Backend:
     """Small common interface for OCR and vision-language backends."""
 
     provider = "unknown"
+    capabilities = BackendCapabilities()
 
     def __enter__(self):
         return self
@@ -115,6 +131,13 @@ def parse_model(selector: str) -> tuple[str, str]:
 
 class OllamaBackend(Backend):
     provider = "ollama"
+    capabilities = BackendCapabilities(
+        batching=False,
+        streaming=False,
+        concurrency_safe=False,
+        timing_hooks=("ollama_server_generation", "ollama_model_load"),
+        usage_fields=("prompt_eval_count", "eval_count"),
+    )
 
     def __init__(self, base_url: str, timeout: float, settings: dict[str, Any]) -> None:
         client_type = settings.get("client_factory", OllamaClient)
@@ -160,8 +183,38 @@ class OllamaBackend(Backend):
             key: value
             for key, value in options.items()
             if key not in {"image_detail", "reasoning_effort", "max_output_tokens"}
+            and not key.startswith("_vlm_bench_")
         }
-        return self.client.transcribe(model, image_path, prompt, clean_options)
+        result = self.client.transcribe(model, image_path, prompt, clean_options)
+        if not isinstance(result, dict):
+            return result
+        timing_fields = {
+            "total_duration": "request_total",
+            "load_duration": "model_load",
+            "prompt_eval_duration": "prompt_evaluation",
+            "eval_duration": "generation",
+        }
+        timings = []
+        for field, metric in timing_fields.items():
+            value = result.get(field)
+            if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0:
+                timings.append(
+                    timing_observation(
+                        metric,
+                        float(value) / 1_000_000_000,
+                        unit="seconds",
+                        source="provider_reported",
+                        start_boundary=f"ollama.{metric}.start",
+                        end_boundary=f"ollama.{metric}.complete",
+                    )
+                )
+        if timings:
+            details = result.get("provider_details")
+            if not isinstance(details, dict):
+                details = {}
+            details["timing_observations"] = timings
+            result["provider_details"] = details
+        return result
 
     def unload(self, model: str) -> None:
         self.client.unload(model)
@@ -171,6 +224,15 @@ class TrOCRBackend(Backend):
     """Lazy Transformers adapter for single handwritten prose lines."""
 
     provider = "trocr"
+    capabilities = BackendCapabilities(
+        supported_tracks=frozenset({"prose"}),
+        supported_sample_types=frozenset({"line", "word"}),
+        batching=False,
+        streaming=False,
+        concurrency_safe=False,
+        timing_hooks=("model_load", "image_preprocessing", "inference", "output_conversion"),
+        usage_fields=("eval_count",),
+    )
 
     def __init__(self, timeout: float, settings: dict[str, Any]) -> None:
         self.timeout = timeout
@@ -178,6 +240,7 @@ class TrOCRBackend(Backend):
         self._models: dict[str, tuple[Any, Any, Any]] = {}
         self._identities: dict[str, dict[str, Any]] = {}
         self._load_durations: dict[str, int] = {}
+        self._device_resolutions: dict[str, DeviceResolution] = {}
 
     @staticmethod
     def _extra_error() -> RuntimeError:
@@ -236,23 +299,17 @@ class TrOCRBackend(Backend):
         except ImportError as exc:
             raise self._extra_error() from exc
         configured_device = self.settings.get("device", "auto")
-        if configured_device not in {"auto", "cpu", "mps"}:
-            raise ValueError("TrOCR device must be auto, cpu, or mps")
-        mps_available = bool(
-            getattr(getattr(torch.backends, "mps", None), "is_available", lambda: False)()
-        )
-        preferred_device = (
-            configured_device if configured_device != "auto" else "mps" if mps_available else "cpu"
-        )
-        if preferred_device == "mps" and not mps_available:
-            preferred_device = "cpu"
+        resolution = resolve_device(configured_device, torch_module=torch)
+        self._device_resolutions[model] = resolution
         identity = {
             "provider": self.provider,
             "model": repo_or_path,
             "revision": revision,
             "checkpoint_sha256": local_hash,
             "task": "handwritten-prose-line-ocr",
-            "device": preferred_device,
+            "device": resolution.actual,
+            "requested_device": resolution.requested,
+            "runtime_identity": runtime_identity(resolution, torch_module=torch),
         }
         if model == DEFAULT_TROCR_MODEL:
             identity["pretrained_data_note"] = "The published checkpoint is IAM-trained."
@@ -273,34 +330,45 @@ class TrOCRBackend(Backend):
         revision = identity.get("revision")
         processor = None
         loaded_model = None
-        requested_device = identity["device"]
+        resolution = self._device_resolutions.get(model) or resolve_device(
+            self.settings.get("device", "auto"), torch_module=torch
+        )
+        requested_device = resolution.torch_device
         load_started = time.perf_counter()
         try:
             processor = TrOCRProcessor.from_pretrained(location, revision=revision, use_fast=False)
             loaded_model = VisionEncoderDecoderModel.from_pretrained(location, revision=revision)
+            synchronize(resolution, torch_module=torch)
             try:
                 loaded_model.to(requested_device)
-                selected_device = requested_device
-            except Exception:
-                if requested_device != "mps":
+                active_resolution = resolution
+            except Exception as device_error:
+                if resolution.requested != "auto" or requested_device == "cpu":
                     raise
                 del loaded_model
                 loaded_model = VisionEncoderDecoderModel.from_pretrained(
                     location, revision=revision
                 )
                 loaded_model.to("cpu")
-                selected_device = "cpu"
+                active_resolution = resolution.with_fallback(
+                    "cpu",
+                    f"automatic {resolution.runtime} model placement failed ({type(device_error).__name__})",
+                )
             loaded_model.eval()
+            synchronize(active_resolution, torch_module=torch)
         except Exception as exc:
             if processor is not None:
                 del processor
             if loaded_model is not None:
                 del loaded_model
             raise RuntimeError(
-                f"Could not load TrOCR model {model!r} ({type(exc).__name__})"
+                f"Could not load TrOCR model {model!r} on device {requested_device!r} "
+                f"({type(exc).__name__})"
             ) from None
         self._models[model] = (processor, loaded_model, torch)
-        identity["device"] = selected_device
+        self._device_resolutions[model] = active_resolution
+        identity["device"] = active_resolution.actual
+        identity["runtime_identity"] = runtime_identity(active_resolution, torch_module=torch)
         self._load_durations[model] = int((time.perf_counter() - load_started) * 1_000_000_000)
         config = getattr(loaded_model, "config", None)
         resolved = getattr(config, "_commit_hash", None)
@@ -313,10 +381,19 @@ class TrOCRBackend(Backend):
         try:
             from PIL import Image
 
+            resolution = self._device_resolutions[model]
+            prep_started = time.perf_counter()
             with Image.open(image_path) as image:
-                pixels = processor(images=image.convert("RGB"), return_tensors="pt").pixel_values
-            device = self._identities[model]["device"]
+                rgb_image = image.convert("RGB")
+                try:
+                    rgb_image.load()
+                    pixels = processor(images=rgb_image, return_tensors="pt").pixel_values
+                finally:
+                    rgb_image.close()
+            device = resolution.torch_device
             pixels = pixels.to(device)
+            synchronize(resolution, torch_module=torch)
+            preprocessing_seconds = time.perf_counter() - prep_started
             max_new_tokens = options.get("num_predict", 128)
             if isinstance(max_new_tokens, bool) or not isinstance(max_new_tokens, int):
                 max_new_tokens = 128
@@ -328,6 +405,7 @@ class TrOCRBackend(Backend):
                 or not 1 <= num_beams <= 10
             ):
                 raise ValueError("TrOCR num_beams must be an integer from 1 to 10")
+            synchronize(resolution, torch_module=torch)
             started = time.perf_counter()
             with torch.inference_mode():
                 generated = loaded_model.generate(
@@ -336,15 +414,58 @@ class TrOCRBackend(Backend):
                     do_sample=False,
                     num_beams=num_beams,
                 )
+            synchronize(resolution, torch_module=torch)
             generation_seconds = time.perf_counter() - started
             token_ids = generated[0]
             token_count = int(token_ids.shape[-1])
             start_id = getattr(loaded_model.config, "decoder_start_token_id", None)
             if start_id is not None and token_count and int(token_ids[0]) == int(start_id):
                 token_count -= 1
+            conversion_started = time.perf_counter()
             text = processor.batch_decode(generated, skip_special_tokens=True)[0]
+            conversion_seconds = time.perf_counter() - conversion_started
             eos_id = getattr(loaded_model.config, "eos_token_id", None)
             ended = bool(eos_id is not None and int(generated[0][-1]) == int(eos_id))
+            load_duration = self._load_durations.pop(model, None)
+            timings = [
+                timing_observation(
+                    "model_load",
+                    load_duration / 1_000_000_000 if load_duration is not None else None,
+                    unit="seconds",
+                    source="adapter_instrumented" if load_duration is not None else "unavailable",
+                    start_boundary="model_load.start" if load_duration is not None else None,
+                    end_boundary="model_load.complete" if load_duration is not None else None,
+                    unavailable_reason=(
+                        None
+                        if load_duration is not None
+                        else "Model was loaded before this request"
+                    ),
+                ),
+                timing_observation(
+                    "image_preprocessing",
+                    preprocessing_seconds,
+                    unit="seconds",
+                    source="adapter_instrumented",
+                    start_boundary="image_open.start",
+                    end_boundary="input_tensor.device_ready",
+                ),
+                timing_observation(
+                    "inference",
+                    generation_seconds,
+                    unit="seconds",
+                    source="adapter_instrumented",
+                    start_boundary="model.generate.start_after_sync",
+                    end_boundary="model.generate.complete_after_sync",
+                ),
+                timing_observation(
+                    "output_conversion",
+                    conversion_seconds,
+                    unit="seconds",
+                    source="adapter_instrumented",
+                    start_boundary="decode.start",
+                    end_boundary="decode.complete",
+                ),
+            ]
             return {
                 "model": model,
                 "message": {"role": "assistant", "content": text},
@@ -355,13 +476,17 @@ class TrOCRBackend(Backend):
                 if token_count >= max_new_tokens
                 else "stop",
                 "eval_count": token_count,
-                "load_duration": self._load_durations.pop(model, 0),
+                "load_duration": load_duration or 0,
                 "provider": self.provider,
                 "provider_details": {
-                    "device": device,
+                    "device": self._identities[model]["device"],
+                    "requested_device": resolution.requested,
+                    "runtime_identity": self._identities[model]["runtime_identity"],
                     "revision": self._identities[model].get("revision"),
                     "checkpoint_sha256": self._identities[model].get("checkpoint_sha256"),
                     "generation_seconds": generation_seconds,
+                    "timing_observations": timings,
+                    "memory": memory_diagnostics(resolution, torch_module=torch),
                     "num_beams": num_beams,
                     "processor_use_fast": False,
                     "prompt_supported": False,
@@ -369,6 +494,7 @@ class TrOCRBackend(Backend):
                         key
                         for key in options
                         if key not in {"num_predict", "num_beams", "device", "revision"}
+                        and not key.startswith("_vlm_bench_")
                     ),
                 },
             }
@@ -381,8 +507,10 @@ class TrOCRBackend(Backend):
         loaded = self._models.pop(model, None)
         self._load_durations.pop(model, None)
         if loaded is None:
+            self._device_resolutions.pop(model, None)
             return
         del loaded
+        self._device_resolutions.pop(model, None)
         gc.collect()
         try:
             import torch
@@ -393,10 +521,385 @@ class TrOCRBackend(Backend):
             pass
 
 
+class PythonAdapterBackend(Backend):
+    """One-attempt backend for an importable local Python/PyTorch adapter."""
+
+    provider = "python"
+
+    def __init__(self, timeout: float, settings: dict[str, Any]) -> None:
+        self.timeout = timeout
+        self.settings = dict(settings)
+        self.capabilities = BackendCapabilities()
+        self._adapter: Any | None = None
+        self._adapter_spec: str | None = None
+        self._module_name: str | None = None
+        self._factory_name: str | None = None
+        self._adapter_sha256: str | None = None
+        self._device_resolution: DeviceResolution | None = None
+        self._runtime: dict[str, Any] | None = None
+        self._identity: dict[str, Any] = {}
+        self._loaded_model: str | None = None
+        self._load_duration_ns: int | None = None
+        self._closed = False
+
+    def _ensure_adapter(self, model: str) -> Any:
+        if self._adapter is not None:
+            if self._adapter_spec != model:
+                raise ValueError(
+                    "One Python adapter backend instance can serve only one adapter selector"
+                )
+            return self._adapter
+        factory, module, source_hash = import_adapter_factory(model)
+        try:
+            adapter = factory()
+        except Exception as exc:
+            raise RuntimeError(
+                f"Custom adapter factory {model!r} failed to initialize ({type(exc).__name__})"
+            ) from None
+
+        def discard_adapter() -> None:
+            close = getattr(adapter, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception:
+                    pass
+
+        required = ("load", "preprocess", "infer", "decode")
+        missing = [name for name in required if not callable(getattr(adapter, name, None))]
+        if missing:
+            discard_adapter()
+            raise TypeError("Custom adapter is missing methods: " + ", ".join(missing))
+        try:
+            raw_capabilities = getattr(adapter, "capabilities", None)
+            if callable(raw_capabilities) and not isinstance(raw_capabilities, Mapping):
+                raw_capabilities = raw_capabilities()
+            capabilities = BackendCapabilities.from_value(raw_capabilities)
+        except (TypeError, ValueError) as exc:
+            discard_adapter()
+            raise TypeError(f"Custom adapter capabilities are invalid: {exc}") from None
+        except Exception as exc:
+            discard_adapter()
+            raise RuntimeError(
+                f"Custom adapter capabilities failed ({type(exc).__name__})"
+            ) from None
+        try:
+            import torch
+        except ImportError as exc:
+            discard_adapter()
+            raise RuntimeError(
+                "Custom local Python adapters require PyTorch; install PyTorch before running"
+            ) from exc
+        try:
+            resolution = resolve_device(self.settings.get("device", "auto"), torch_module=torch)
+            runtime = runtime_identity(resolution, torch_module=torch)
+        except Exception:
+            discard_adapter()
+            raise
+        module_name, factory_name = model.rsplit(":", 1)
+        self._adapter = adapter
+        self.capabilities = capabilities
+        self._adapter_spec = model
+        self._module_name = module_name
+        self._factory_name = factory_name
+        self._adapter_sha256 = source_hash
+        self._device_resolution = resolution
+        self._runtime = runtime
+        return adapter
+
+    def validate_model(self, model: str) -> dict[str, Any]:
+        if not isinstance(model, str) or not model.strip():
+            raise ValueError("Custom Python adapter selector cannot be empty")
+        adapter = self._ensure_adapter(model)
+        identity_hook = getattr(adapter, "identity", None)
+        if callable(identity_hook):
+            try:
+                adapter_identity = identity_hook(
+                    model,
+                    settings=dict(self.settings),
+                    runtime=dict(self._runtime or {}),
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Custom adapter identity failed ({type(exc).__name__})"
+                ) from None
+        else:
+            adapter_identity = {}
+        identity = {
+            "provider": self.provider,
+            "model": model,
+            "adapter_module": self._module_name,
+            "adapter_factory": self._factory_name,
+            "adapter_sha256": self._adapter_sha256,
+            "device": (self._device_resolution.actual if self._device_resolution else None),
+            "requested_device": (
+                self._device_resolution.requested if self._device_resolution else None
+            ),
+            "runtime_identity": dict(self._runtime or {}),
+        }
+        identity.update(safe_adapter_identity(adapter_identity))
+        declared_version = getattr(adapter, "adapter_version", None)
+        if isinstance(declared_version, (str, int)) and not isinstance(declared_version, bool):
+            identity.setdefault("adapter_version", declared_version)
+        self._identity = identity
+        return dict(identity)
+
+    def load(self, model: str) -> None:
+        if self._loaded_model == model:
+            return
+        if self._loaded_model is not None:
+            self.unload(self._loaded_model)
+        adapter = self._ensure_adapter(model)
+        if not self._identity:
+            self.validate_model(model)
+        resolution = self._device_resolution
+        if resolution is None:
+            raise RuntimeError("Custom adapter device was not resolved")
+        try:
+            import torch
+
+            synchronize(resolution, torch_module=torch)
+            started = time.perf_counter()
+            try:
+                adapter.load(model, device=resolution.torch_device, settings=dict(self.settings))
+                synchronize(resolution, torch_module=torch)
+            except Exception as accelerator_error:
+                if resolution.requested != "auto" or resolution.torch_device == "cpu":
+                    raise RuntimeError(
+                        f"Custom adapter load failed on requested device "
+                        f"{resolution.requested!r} ({type(accelerator_error).__name__})"
+                    ) from None
+                unload_hook = getattr(adapter, "unload", None)
+                if callable(unload_hook):
+                    unload_hook(model)
+                fallback = resolution.with_fallback(
+                    "cpu",
+                    f"automatic {resolution.runtime} adapter load failed "
+                    f"({type(accelerator_error).__name__})",
+                )
+                adapter.load(model, device="cpu", settings=dict(self.settings))
+                synchronize(fallback, torch_module=torch)
+                self._device_resolution = fallback
+                self._runtime = runtime_identity(fallback, torch_module=torch)
+                self._identity.update(
+                    device=fallback.actual,
+                    requested_device=fallback.requested,
+                    runtime_identity=dict(self._runtime),
+                )
+            self._load_duration_ns = int((time.perf_counter() - started) * 1_000_000_000)
+        except Exception as exc:
+            self._loaded_model = None
+            self._load_duration_ns = None
+            raise RuntimeError(
+                f"Custom adapter load failed on device {resolution.actual!r} ({type(exc).__name__})"
+            ) from None
+        self._loaded_model = model
+
+    @staticmethod
+    def _controls(options: dict[str, Any]) -> dict[str, Any]:
+        hidden = {
+            "device",
+            "revision",
+            "reference",
+            "reference_text",
+            "ground_truth",
+            "target",
+            "transcript",
+        }
+        return {
+            key: value
+            for key, value in options.items()
+            if key not in hidden and not key.startswith("_vlm_bench_")
+        }
+
+    def transcribe(self, model, image_path, prompt, options):
+        self.load(model)
+        adapter = self._adapter
+        resolution = self._device_resolution
+        if adapter is None or resolution is None:
+            raise RuntimeError("Custom adapter is not initialized")
+        if not isinstance(options, dict):
+            raise TypeError("Custom adapter controls must be a dictionary")
+        track = options.get("_vlm_bench_track")
+        sample_type = options.get("_vlm_bench_sample_type")
+        if not self.capabilities.supports(track, sample_type):
+            raise RuntimeError(
+                f"Custom adapter does not support track {track!r} and sample type {sample_type!r}"
+            )
+        controls = self._controls(options)
+        try:
+            import torch
+            from PIL import Image
+
+            synchronize(resolution, torch_module=torch)
+            prep_started = time.perf_counter()
+            with Image.open(image_path) as opened:
+                image = opened.convert("RGB")
+                try:
+                    image.load()
+                    prepared = adapter.preprocess(
+                        image,
+                        track=track,
+                        prompt=prompt,
+                        controls=dict(controls),
+                    )
+                    synchronize(resolution, torch_module=torch)
+                    preprocessing_seconds = time.perf_counter() - prep_started
+                    synchronize(resolution, torch_module=torch)
+                    inference_started = time.perf_counter()
+                    output = adapter.infer(prepared, controls=dict(controls))
+                    synchronize(resolution, torch_module=torch)
+                    inference_seconds = time.perf_counter() - inference_started
+                    conversion_started = time.perf_counter()
+                    text = adapter.decode(output)
+                    conversion_seconds = time.perf_counter() - conversion_started
+                finally:
+                    image.close()
+        except (OSError, ValueError, TypeError) as exc:
+            raise RuntimeError(f"Custom adapter request failed ({type(exc).__name__})") from None
+        except Exception as exc:
+            raise RuntimeError(f"Custom adapter inference failed ({type(exc).__name__})") from None
+        if not isinstance(text, str):
+            raise TypeError("Custom adapter decode(output) must return a string")
+
+        load_duration = self._load_duration_ns
+        self._load_duration_ns = None
+        timings = [
+            timing_observation(
+                "model_load",
+                load_duration / 1_000_000_000 if load_duration is not None else None,
+                unit="seconds",
+                source="adapter_instrumented" if load_duration is not None else "unavailable",
+                start_boundary="adapter.load.start" if load_duration is not None else None,
+                end_boundary="adapter.load.complete" if load_duration is not None else None,
+                unavailable_reason=(
+                    None if load_duration is not None else "Model was loaded before this request"
+                ),
+            ),
+            timing_observation(
+                "image_preprocessing",
+                preprocessing_seconds,
+                unit="seconds",
+                source="adapter_instrumented",
+                start_boundary="image_open.start",
+                end_boundary="adapter.preprocess.complete_after_sync",
+            ),
+            timing_observation(
+                "inference",
+                inference_seconds,
+                unit="seconds",
+                source="adapter_instrumented",
+                start_boundary="adapter.infer.start_after_sync",
+                end_boundary="adapter.infer.complete_after_sync",
+            ),
+            timing_observation(
+                "output_conversion",
+                conversion_seconds,
+                unit="seconds",
+                source="adapter_instrumented",
+                start_boundary="adapter.decode.start",
+                end_boundary="adapter.decode.complete",
+            ),
+        ]
+        timing_hook = getattr(adapter, "timing_observations", None)
+        if callable(timing_hook):
+            try:
+                timings.extend(
+                    normalize_timing_observations(
+                        timing_hook(), default_source="adapter_instrumented"
+                    )
+                )
+            except Exception as exc:
+                raise RuntimeError(
+                    f"Custom adapter timing observations are invalid ({type(exc).__name__})"
+                ) from None
+
+        usage = None
+        if isinstance(output, Mapping) and self.capabilities.usage_fields:
+            raw_usage = output.get("usage")
+            if isinstance(raw_usage, Mapping):
+                usage = {
+                    key: value
+                    for key, value in raw_usage.items()
+                    if key in self.capabilities.usage_fields
+                    and isinstance(value, (str, int, float))
+                    and not isinstance(value, bool)
+                    and (not isinstance(value, float) or math.isfinite(value))
+                }
+                if not usage:
+                    usage = None
+        provider_details = {
+            "device": resolution.actual,
+            "requested_device": resolution.requested,
+            "runtime_identity": dict(self._runtime or {}),
+            "timing_observations": timings,
+            "memory": memory_diagnostics(resolution, torch_module=torch),
+        }
+        return {
+            "model": self._identity.get("model", model),
+            "message": {"role": "assistant", "content": text},
+            "done": True,
+            "done_reason": "stop",
+            "provider": self.provider,
+            "usage": usage,
+            "provider_details": provider_details,
+            "load_duration": load_duration or 0,
+        }
+
+    def unload(self, model: str) -> None:
+        if self._adapter is None or self._loaded_model is None:
+            self._load_duration_ns = None
+            return
+        unload_hook = getattr(self._adapter, "unload", None)
+        try:
+            if callable(unload_hook):
+                unload_hook(model)
+        except Exception as exc:
+            raise RuntimeError(f"Custom adapter unload failed ({type(exc).__name__})") from None
+        finally:
+            self._loaded_model = None
+            self._load_duration_ns = None
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        adapter = self._adapter
+        if adapter is not None:
+            errors: list[str] = []
+            try:
+                if self._loaded_model is not None:
+                    self.unload(self._loaded_model)
+            except Exception as exc:
+                errors.append(f"unload ({type(exc).__name__})")
+            finally:
+                close_hook = getattr(adapter, "close", None)
+                try:
+                    if callable(close_hook):
+                        close_hook()
+                except Exception as exc:
+                    errors.append(f"close ({type(exc).__name__})")
+                finally:
+                    self._adapter = None
+                    self._identity.clear()
+                    self._runtime = None
+                    self._device_resolution = None
+                    self._closed = True
+                    gc.collect()
+            if errors:
+                raise RuntimeError("Custom adapter cleanup failed: " + ", ".join(errors))
+
+
 class _ResponsesBackend(Backend):
     """Common streaming Responses API implementation."""
 
     provider = "openai"
+    capabilities = BackendCapabilities(
+        batching=False,
+        streaming=False,
+        concurrency_safe=True,
+        timing_hooks=("image_encoding", "time_to_first_output", "response_stream"),
+        usage_fields=("input_tokens", "output_tokens", "total_tokens"),
+    )
 
     def __init__(self, timeout: float, settings: dict[str, Any]) -> None:
         self.timeout = timeout
@@ -522,6 +1025,7 @@ class _ResponsesBackend(Backend):
         return max(0.0, delay)
 
     def _transcribe(self, model, image_path, prompt, options, *, managed):
+        encoding_started = time.perf_counter()
         try:
             image = Path(image_path).read_bytes()
         except OSError as exc:
@@ -532,6 +1036,7 @@ class _ResponsesBackend(Backend):
         if mime_type not in {"image/png", "image/jpeg", "image/webp", "image/gif"}:
             mime_type = "image/png"
         image_url = f"data:{mime_type};base64,{base64.b64encode(image).decode('ascii')}"
+        image_encoding_seconds = time.perf_counter() - encoding_started
         image_detail = self.settings.get("image_detail", options.get("image_detail", "auto"))
         if image_detail not in {"auto", "low", "high"}:
             raise ValueError("Image detail must be one of auto, low, or high")
@@ -580,6 +1085,7 @@ class _ResponsesBackend(Backend):
                 "image_detail",
                 "reasoning_effort",
             }
+            and not key.startswith("_vlm_bench_")
         )
         if self.provider == "chatgpt":
             unsupported_options = sorted(
@@ -588,6 +1094,8 @@ class _ResponsesBackend(Backend):
         output_parts: list[str] = []
         completed_data: dict[str, Any] | None = None
         retry_count = 0
+        first_output_seconds: float | None = None
+        response_stream_seconds: float | None = None
         # Only retry failures raised while establishing the connection. Once a
         # response begins, a dropped stream may represent a completed billable
         # request, so the adapter never replays it.
@@ -595,6 +1103,8 @@ class _ResponsesBackend(Backend):
         for attempt in range(max_attempts):
             output_parts.clear()
             completed_data = None
+            request_started = time.perf_counter()
+            first_output_at: float | None = None
             try:
                 with self.client.stream(
                     "POST", "/responses", headers=self._headers(), json=payload
@@ -644,6 +1154,8 @@ class _ResponsesBackend(Backend):
                         if event_type == "response.output_text.delta":
                             delta = event.get("delta")
                             if isinstance(delta, str):
+                                if first_output_at is None:
+                                    first_output_at = time.perf_counter()
                                 output_parts.append(delta)
                         elif event_type == "response.completed":
                             completed_data = (
@@ -651,6 +1163,9 @@ class _ResponsesBackend(Backend):
                                 if isinstance(event.get("response"), dict)
                                 else {}
                             )
+                            response_stream_seconds = time.perf_counter() - request_started
+                            if first_output_at is not None:
+                                first_output_seconds = first_output_at - request_started
                         elif event_type in {"response.failed", "error"}:
                             failure = (
                                 event.get("response")
@@ -722,6 +1237,52 @@ class _ResponsesBackend(Backend):
         if isinstance(usage, dict):
             result["prompt_eval_count"] = usage.get("input_tokens")
             result["eval_count"] = usage.get("output_tokens")
+        result["provider_details"]["timing_observations"] = [
+            timing_observation(
+                "image_encoding",
+                image_encoding_seconds,
+                unit="seconds",
+                source="client_measured",
+                start_boundary="image_read.start",
+                end_boundary="image_data_uri.complete",
+            ),
+            timing_observation(
+                "time_to_first_output",
+                first_output_seconds,
+                unit="seconds",
+                source="client_measured" if first_output_seconds is not None else "unavailable",
+                start_boundary="client_request.start" if first_output_seconds is not None else None,
+                end_boundary="first_text_delta" if first_output_seconds is not None else None,
+                unavailable_reason=(
+                    None
+                    if first_output_seconds is not None
+                    else "The provider returned no streamed text delta"
+                ),
+            ),
+            timing_observation(
+                "response_stream",
+                response_stream_seconds,
+                unit="seconds",
+                source="client_measured" if response_stream_seconds is not None else "unavailable",
+                start_boundary="client_request.start"
+                if response_stream_seconds is not None
+                else None,
+                end_boundary="response.completed" if response_stream_seconds is not None else None,
+                unavailable_reason=(
+                    None
+                    if response_stream_seconds is not None
+                    else "No completed response timing was available"
+                ),
+            ),
+            unavailable_timing(
+                "prefill_duration",
+                "The provider does not expose a comparable prefill timing",
+            ),
+            unavailable_timing(
+                "decode_duration",
+                "The provider does not expose a comparable decode timing",
+            ),
+        ]
         return result
 
     @staticmethod
@@ -778,6 +1339,8 @@ def create_backend(
         return OllamaBackend(base_url, timeout, settings)
     if name == "trocr":
         return TrOCRBackend(timeout, settings)
+    if name == "python":
+        return PythonAdapterBackend(timeout, settings)
     if name == "chatgpt":
         return ChatGPTBackend(timeout, settings)
     if name == "openai":

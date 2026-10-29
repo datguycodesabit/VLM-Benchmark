@@ -8,6 +8,7 @@ import pytest
 from PIL import Image
 
 from vlm_bench.backends import BackendPaused, TrOCRBackend, create_backend, parse_model
+from vlm_bench.measurement import TimingObservation, normalize_timing_observations
 
 
 def _sse(*events):
@@ -34,6 +35,7 @@ def _completed(text="written words", usage=None):
         ("trocr:microsoft/trocr-base-handwritten", ("trocr", "microsoft/trocr-base-handwritten")),
         ("chatgpt:gpt-6.1-sol", ("chatgpt", "gpt-6.1-sol")),
         ("openai:gpt-6.1-sol", ("openai", "gpt-6.1-sol")),
+        ("python:my_adapter:Factory", ("python", "my_adapter:Factory")),
         ("external:tesseract", ("external", "tesseract")),
         ("EXTERNAL:My OCR", ("external", "My OCR")),
     ],
@@ -46,6 +48,26 @@ def test_parse_provider_selector(selector, expected):
 def test_parse_model_rejects_empty_selector(selector):
     with pytest.raises(ValueError):
         parse_model(selector)
+
+
+def test_normalized_timing_observations_require_provenance_and_boundaries():
+    observation = normalize_timing_observations(
+        [
+            {
+                "metric_name": "request_elapsed",
+                "value": 0.25,
+                "unit": "seconds",
+                "source": "client_measured",
+                "start_boundary": "send",
+                "end_boundary": "complete",
+            }
+        ]
+    )[0]
+    assert observation["source"] == "client_measured"
+    with pytest.raises(ValueError, match="finite non-negative"):
+        TimingObservation("latency", -0.1, "seconds", "client_measured", "start", "end")
+    with pytest.raises(ValueError, match="unavailable_reason"):
+        TimingObservation("latency", None, "seconds", "unavailable", None, None)
 
 
 def test_factory_rejects_unknown_provider():
@@ -128,6 +150,18 @@ def test_openai_streams_response_and_keeps_credentials_out_of_result(tmp_path: P
     assert result["usage"]["total_tokens"] == 23
     assert result["provider_details"]["unsupported_options"] == ["temperature"]
     assert result["provider_details"]["retry_count"] == 0
+    observations = result["provider_details"]["timing_observations"]
+    assert {item["metric_name"] for item in observations} >= {
+        "image_encoding",
+        "time_to_first_output",
+        "response_stream",
+        "prefill_duration",
+        "decode_duration",
+    }
+    assert all(
+        {"metric_name", "value", "unit", "source", "start_boundary", "end_boundary"} <= item.keys()
+        for item in observations
+    )
     assert "unit-test-secret" not in repr(result)
     payload = json.loads(requests[-1].content)
     assert payload["store"] is False and payload["stream"] is True
@@ -476,3 +510,101 @@ def test_trocr_missing_optional_transformers_is_actionable(tmp_path, monkeypatch
     backend.validate_model(str(checkpoint))
     with pytest.raises(RuntimeError, match="uv sync --extra trocr"):
         backend.load(str(checkpoint))
+
+
+def test_python_adapter_capabilities_lifecycle_and_no_reference_leakage(tmp_path, monkeypatch):
+    module_file = tmp_path / "toy_adapter.py"
+    module_file.write_text(
+        """
+instances = []
+class Adapter:
+    capabilities = {
+        'supported_tracks': ['prose'],
+        'supported_sample_types': ['line'],
+        'batching': False,
+        'streaming': False,
+        'concurrency_safe': False,
+        'timing_hooks': ['preprocessing', 'inference'],
+        'usage_fields': [],
+    }
+    def __init__(self):
+        self.loaded = None
+        self.events = []
+        instances.append(self)
+    def load(self, model, *, device, settings):
+        self.loaded = (model, device)
+        self.events.append('load')
+    def preprocess(self, image, *, track, prompt, controls):
+        self.events.append('preprocess')
+        assert image.mode == 'RGB'
+        self.input = (image.size, track, prompt, dict(controls))
+        return image.size
+    def infer(self, prepared, *, controls):
+        self.events.append('infer')
+        return prepared
+    def decode(self, output):
+        self.events.append('decode')
+        return f'recognized {output[0]}x{output[1]}'
+    def identity(self, model, *, settings, runtime):
+        return {'adapter_version': 'test-v1', 'token': 'must-not-leak'}
+    def timing_observations(self):
+        return []
+    def unload(self, model):
+        self.events.append('unload')
+        self.loaded = None
+    def close(self):
+        self.events.append('close')
+""",
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.setitem(
+        sys.modules,
+        "torch",
+        SimpleNamespace(
+            __version__="test-torch",
+            version=SimpleNamespace(cuda=None, hip=None),
+            backends=SimpleNamespace(mps=SimpleNamespace(is_available=lambda: False)),
+        ),
+    )
+
+    image_path = tmp_path / "sample.png"
+    Image.new("RGB", (60, 20), "white").save(image_path)
+    with create_backend("python") as backend:
+        identity = backend.validate_model("toy_adapter:Adapter")
+        capabilities = backend.capabilities
+        assert capabilities.supports("prose", "line")
+        assert not capabilities.supports("equation", "line")
+        assert identity["adapter_sha256"]
+        assert identity["adapter_version"] == "test-v1"
+        assert "token" not in identity
+
+        result = backend.transcribe_once(
+            "toy_adapter:Adapter",
+            image_path,
+            "Transcribe only the image",
+            {
+                "num_predict": 32,
+                "_vlm_bench_track": "prose",
+                "_vlm_bench_sample_type": "line",
+                "reference": "secret reference",
+            },
+        )
+        adapter = sys.modules["toy_adapter"].instances[0]
+        assert adapter.input == (
+            (60, 20),
+            "prose",
+            "Transcribe only the image",
+            {"num_predict": 32},
+        )
+        assert adapter.events == ["load", "preprocess", "infer", "decode"]
+        assert result["message"]["content"] == "recognized 60x20"
+        assert result["provider_details"]["device"] == "cpu"
+        assert all(
+            "secret reference" not in repr(item)
+            for item in result["provider_details"]["timing_observations"]
+        )
+
+    assert adapter.events == ["load", "preprocess", "infer", "decode", "unload", "close"]
+    assert adapter.loaded is None
+    assert backend._adapter is None

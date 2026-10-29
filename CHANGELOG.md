@@ -4,6 +4,10 @@ Notable changes to this project are recorded here.
 
 ## Unreleased
 
+- Add versioned weighted scoring, failure/missing penalties, separate prose/equation leaderboards, anchored accuracy bands, and conservative equation equivalence diagnostics.
+- Add configuration version 3, three-pass defaults, an editable configuration wizard, shared offline HTML/Excel/CSV/JSON reports, and explicit measurement profiles.
+- Add a shared PyTorch device service for CPU/MPS/CUDA/ROCm selection, normalized timing evidence, and local custom Python adapter lifecycle/capabilities.
+
 - Add strict research eligibility checks, document/writer split protocols, and split-leakage audits with perceptual near-duplicate review findings.
 - Add error inspection HTML, subgroup reports, formula-rendering and annotation metrics, external prediction import, and reproducible OCR baseline examples.
 - Add versioned experiment suites with preview/resume, prompt and control variants, repetitions, and independent document-level reporting.

@@ -192,7 +192,21 @@ def test_json_run_directory_deduplicates_engine_and_cli_messages(tmp_path, monke
     monkeypatch.setattr(engine, "preview", lambda *args, **kwargs: {"models": []})
     monkeypatch.setattr(engine, "run", fake_run)
     monkeypatch.setattr(cli, "_report", lambda path: None)
-    assert main(["run", "--data", str(tmp_path), "--models", "ollama:sample", "--json"]) == 0
+    assert (
+        main(
+            [
+                "run",
+                "--data",
+                str(tmp_path),
+                "--models",
+                "ollama:sample",
+                "--repeats",
+                "1",
+                "--json",
+            ]
+        )
+        == 0
+    )
     payload = json.loads(capsys.readouterr().out)
     assert payload["run_directory"] == str(run_dir.resolve())
     assert not isinstance(payload["run_directory"], list)
@@ -292,6 +306,8 @@ def test_json_run_pause_status_and_resume_limit_overrides(tmp_path, monkeypatch,
                 str(tmp_path),
                 "--models",
                 "openai:example",
+                "--repeats",
+                "1",
                 "--max-requests",
                 "1",
                 "--max-spend-usd",
@@ -612,6 +628,8 @@ def test_separate_runs_compare_and_cli_token_limit_overrides_config(tmp_path, mo
                 str(snapshot),
                 "--models",
                 "trocr:second",
+                "--repeats",
+                "1",
                 "--output",
                 str(runs),
                 "--no-warmup",
