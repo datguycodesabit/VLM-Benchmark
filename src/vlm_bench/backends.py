@@ -1376,6 +1376,10 @@ class _ResponsesBackend(Backend):
                     "POST", "/responses", headers=self._headers(), json=payload
                 ) as response:
                     if not response.is_success:
+                        # Real streamed HTTP error bodies are not buffered yet.
+                        # Read before extracting the safe code so quota pauses
+                        # and transient retries aren't masked by ResponseNotRead.
+                        response.read()
                         error_code = self._safe_error(response)
                         if self.provider == "chatgpt" and error_code in {
                             "subscription_sharing_usage_limit_exceeded",

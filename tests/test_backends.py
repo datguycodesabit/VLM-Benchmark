@@ -501,6 +501,47 @@ def test_subscription_http_quota_limit_pauses_without_retry(tmp_path, monkeypatc
     assert len(calls) == 1
 
 
+@pytest.mark.parametrize(
+    "status,code,category",
+    [(429, "rate_limit_exceeded", "rate_limited"), (503, "unavailable", "http_503")],
+)
+def test_unbuffered_cloud_http_errors_preserve_retry_classification(
+    tmp_path, monkeypatch, status, code, category
+):
+    from vlm_bench.execution import RetryableProviderError
+
+    image = tmp_path / "line.png"
+    image.write_bytes(b"image")
+
+    def handler(request):
+        return httpx.Response(
+            status,
+            headers={"Retry-After": "0.25"},
+            stream=httpx.ByteStream(json.dumps({"error": {"code": code}}).encode()),
+        )
+
+    monkeypatch.setattr("vlm_bench.backends.auth.get_access_token", lambda client_id: "temporary")
+    with create_backend("chatgpt", settings={"transport": httpx.MockTransport(handler)}) as backend:
+        with pytest.raises(RetryableProviderError) as caught:
+            backend.transcribe_once("model", image, "read", {})
+    assert caught.value.category == category
+    assert caught.value.retry_after_seconds == pytest.approx(0.25)
+
+
+def test_unbuffered_subscription_quota_error_pauses(tmp_path, monkeypatch):
+    image = tmp_path / "line.png"
+    image.write_bytes(b"image")
+
+    def handler(request):
+        body = {"error": {"code": "subscription_sharing_usage_limit_exceeded"}}
+        return httpx.Response(429, stream=httpx.ByteStream(json.dumps(body).encode()))
+
+    monkeypatch.setattr("vlm_bench.backends.auth.get_access_token", lambda client_id: "temporary")
+    with create_backend("chatgpt", settings={"transport": httpx.MockTransport(handler)}) as backend:
+        with pytest.raises(BackendPaused, match="usage_limit_exceeded"):
+            backend.transcribe_once("model", image, "read", {})
+
+
 def test_chatgpt_model_catalog_is_account_specific_and_hides_unlisted_models(
     monkeypatch,
 ):
