@@ -1,7 +1,6 @@
 """Prepare, run/resume, or report a controlled Qwen handwriting diagnostic study."""
 
 import argparse
-import json
 from pathlib import Path
 
 from vlm_bench.diagnostic_study import prepare_study, report_study
@@ -48,13 +47,28 @@ def main():
         result = run_suite(
             args.study / "suite.toml", args.output, resume=args.resume, dry_run=args.dry_run
         )
-        print(json.dumps(result, indent=2))
+        if args.dry_run:
+            for condition in result["conditions"]:
+                preview = condition["preview"]
+                print(
+                    f"{condition['name']}: {preview['sample_count']} images, "
+                    f"{len(preview['models'])} models, {condition['repeats']} pass(es)"
+                )
+        else:
+            for name, condition in result["conditions"].items():
+                print(
+                    f"{name}: {condition['status']} "
+                    f"({condition['completed_repetitions']}/{condition['planned_repetitions']} passes)"
+                )
         if not args.dry_run:
+            if all(row["status"] == "complete" for row in result["conditions"].values()):
+                # Preserve an existing review, and generate diagnostics before
+                # optional presentation exports so they survive export failures.
+                if not (args.output / "diagnostics").exists():
+                    report_study(args.study, args.output, args.output / "diagnostics")
+                print(f"Review: {(args.output / 'diagnostics/review.html').resolve()}")
             for path in write_report(args.output):
                 print(f"Saved: {path}")
-            if all(row["status"] == "complete" for row in result["conditions"].values()):
-                report_study(args.study, args.output, args.output / "diagnostics")
-                print(f"Review: {(args.output / 'diagnostics/review.html').resolve()}")
     else:
         report_study(args.study, args.runs, args.output)
         print(f"Review: {(args.output / 'review.html').resolve()}")

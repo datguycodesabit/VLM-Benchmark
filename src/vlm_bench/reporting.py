@@ -46,6 +46,21 @@ def _escape(value):
     return html.escape(_text(value), quote=True)
 
 
+def _display_metadata(value):
+    """Keep bulk tokenizer arrays out of the HTML DOM; preserve raw JSON evidence."""
+    if isinstance(value, dict):
+        return {key: _display_metadata(child) for key, child in value.items()}
+    if isinstance(value, list):
+        if len(value) > 1000:
+            return {
+                "items": len(value),
+                "sha256": hashlib.sha256(_text(value).encode("utf-8")).hexdigest(),
+                "storage": "Full array retained in evaluation.json and source run metadata",
+            }
+        return [_display_metadata(child) for child in value]
+    return value
+
+
 def _evaluations(report):
     return report.get("conditions", {"Benchmark": report}).items()
 
@@ -290,7 +305,7 @@ def _html(report):
     }
     parts.append(
         "<details><summary>Frozen configuration, environment and evidence</summary>"
-        f"<pre>{_escape(json.dumps(context, ensure_ascii=False, indent=2))}</pre>"
+        f"<pre>{_escape(json.dumps(_display_metadata(context), ensure_ascii=False, indent=2))}</pre>"
         "</details></section>"
     )
     examples = report.get("difficult_examples", [])
@@ -687,8 +702,15 @@ def render_report(report, target, *, formats=("html", "xlsx", "csv", "json")):
                 for key, child in value.items():
                     walk(child, f"{prefix}.{key}" if prefix else str(key))
             elif isinstance(value, list):
-                for index, child in enumerate(value):
-                    walk(child, f"{prefix}[{index}]")
+                if len(value) > 1000:
+                    # Full vocabularies can have 150k+ entries per model and
+                    # exceed Excel's row limit when expanded across conditions.
+                    # Store large arrays losslessly as JSON; the existing text
+                    # overflow mechanism preserves values exceeding cell limits.
+                    evidence_rows.append({"JSON path": prefix, "Value": _text(value)})
+                else:
+                    for index, child in enumerate(value):
+                        walk(child, f"{prefix}[{index}]")
             else:
                 evidence_rows.append({"JSON path": prefix, "Value": _text(value)})
 
