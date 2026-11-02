@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import base64
 import ipaddress
+import json
 import math
+import time
 from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
@@ -252,36 +254,7 @@ class OllamaClient:
         options: dict[str, Any],
     ) -> dict[str, Any]:
         """Submit one image and return Ollama's complete chat response object."""
-        if not model:
-            raise ValueError("Model name cannot be empty")
-        if not isinstance(prompt, str):
-            raise TypeError("Prompt must be a string")
-        if not isinstance(options, dict):
-            raise TypeError("Ollama generation options must be a dictionary")
-        try:
-            image = Path(image_path).read_bytes()
-        except OSError as exc:
-            raise RuntimeError(
-                f"Cannot read image for Ollama request: {image_path}: {exc}"
-            ) from exc
-
-        payload: dict[str, Any] = {
-            "model": model,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": prompt,
-                    "images": [base64.b64encode(image).decode("ascii")],
-                }
-            ],
-            "stream": False,
-            "options": dict(options),
-            "keep_alive": "10m",
-        }
-        thinking = self._model_info_cache.get(model, {}).get("thinking")
-        values = thinking.get("values") if isinstance(thinking, dict) else None
-        if isinstance(values, list) and any(value is False for value in values):
-            payload["think"] = False
+        payload, _ = self._chat_payload(model, image_path, prompt, options, streaming=False)
         data = self._request_json("POST", "/api/chat", payload=payload)
         message = data.get("message")
         if not isinstance(message, dict) or not isinstance(message.get("content"), str):
@@ -289,6 +262,156 @@ class OllamaClient:
         if data.get("done") is not True:
             raise RuntimeError("Ollama /api/chat response was incomplete (done was not true)")
         return data
+
+    def transcribe_stream(
+        self,
+        model: str,
+        image_path: Path,
+        prompt: str,
+        options: dict[str, Any],
+    ) -> tuple[dict[str, Any], dict[str, float | None]]:
+        """Stream one chat response, buffering text while measuring first output.
+
+        The return value keeps the regular complete-response dictionary and a
+        separate set of client timings. ``time_to_first_output`` measures when
+        the first non-empty text chunk reaches this client; it is not a prefill
+        duration.
+        """
+        payload, image_encoding_seconds = self._chat_payload(
+            model, image_path, prompt, options, streaming=True
+        )
+        request_started = time.perf_counter()
+        first_output_seconds: float | None = None
+        response_stream_seconds: float | None = None
+        first_output_at: float | None = None
+        output_parts: list[str] = []
+        terminal: dict[str, Any] | None = None
+
+        try:
+            with self._client.stream("POST", "/api/chat", json=payload) as response:
+                if not response.is_success:
+                    response.read()
+                    if response.status_code == 429:
+                        raw_delay = response.headers.get("Retry-After")
+                        try:
+                            delay = max(0.0, float(raw_delay)) if raw_delay is not None else None
+                        except ValueError:
+                            delay = None
+                        raise RetryableProviderError(
+                            "Ollama generation was rate limited",
+                            retry_after_seconds=delay,
+                            category="rate_limited",
+                        )
+                    if response.status_code in {500, 502, 503, 504}:
+                        raise RetryableProviderError(
+                            f"Ollama generation returned temporary HTTP {response.status_code}",
+                            category=f"http_{response.status_code}",
+                        )
+                    raise RuntimeError(
+                        "Ollama request POST /api/chat failed "
+                        f"(HTTP {response.status_code}): {self._describe_error(response)}"
+                    )
+
+                for line in response.iter_lines():
+                    if not line:
+                        continue
+                    try:
+                        chunk = json.loads(line)
+                    except ValueError:
+                        raise RuntimeError(
+                            "Ollama streaming response contained invalid JSON"
+                        ) from None
+                    if not isinstance(chunk, dict):
+                        continue
+                    if isinstance(chunk.get("error"), str):
+                        raise RuntimeError("Ollama streaming response failed")
+                    message = chunk.get("message")
+                    content = message.get("content") if isinstance(message, dict) else None
+                    if isinstance(content, str):
+                        if content and first_output_at is None:
+                            first_output_at = time.perf_counter()
+                            first_output_seconds = first_output_at - request_started
+                        output_parts.append(content)
+                    if chunk.get("done") is True:
+                        terminal = chunk
+                        response_stream_seconds = time.perf_counter() - request_started
+                        break
+        except (httpx.ConnectError, httpx.ConnectTimeout):
+            raise RetryableProviderError(
+                "Ollama connection failed before response", category="connection_error"
+            ) from None
+        except httpx.TimeoutException:
+            raise RuntimeError(
+                "Ollama streaming response timed out; partial output was discarded"
+            ) from None
+        except httpx.HTTPError as exc:
+            raise RuntimeError(
+                f"Ollama streaming request failed ({type(exc).__name__}); "
+                "partial output was discarded"
+            ) from None
+
+        if terminal is None:
+            raise RuntimeError(
+                "Ollama stream ended without a terminal done event; partial output was discarded"
+            )
+        final_message = terminal.get("message")
+        if not isinstance(final_message, dict):
+            final_message = {"role": "assistant"}
+        else:
+            final_message = dict(final_message)
+        final_message["content"] = "".join(output_parts)
+        result = dict(terminal)
+        result["message"] = final_message
+        timings = {
+            "image_encoding_seconds": image_encoding_seconds,
+            "time_to_first_output_seconds": first_output_seconds,
+            "response_stream_seconds": response_stream_seconds,
+        }
+        return result, timings
+
+    def _chat_payload(
+        self,
+        model: str,
+        image_path: Path,
+        prompt: str,
+        options: dict[str, Any],
+        *,
+        streaming: bool,
+    ) -> tuple[dict[str, Any], float]:
+        """Build an Ollama image request without changing its response shape."""
+        if not model:
+            raise ValueError("Model name cannot be empty")
+        if not isinstance(prompt, str):
+            raise TypeError("Prompt must be a string")
+        if not isinstance(options, dict):
+            raise TypeError("Ollama generation options must be a dictionary")
+        encoding_started = time.perf_counter()
+        try:
+            image = Path(image_path).read_bytes()
+        except OSError as exc:
+            raise RuntimeError(
+                f"Cannot read image for Ollama request: {image_path}: {exc}"
+            ) from exc
+
+        encoded_image = base64.b64encode(image).decode("ascii")
+        payload: dict[str, Any] = {
+            "model": model,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": prompt,
+                    "images": [encoded_image],
+                }
+            ],
+            "stream": streaming,
+            "options": dict(options),
+            "keep_alive": "10m",
+        }
+        thinking = self._model_info_cache.get(model, {}).get("thinking")
+        values = thinking.get("values") if isinstance(thinking, dict) else None
+        if isinstance(values, list) and any(value is False for value in values):
+            payload["think"] = False
+        return payload, time.perf_counter() - encoding_started
 
     def unload(self, model: str) -> None:
         if not model:

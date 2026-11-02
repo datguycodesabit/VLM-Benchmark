@@ -170,8 +170,11 @@ def _validate_model_measurements(
             f"Model {selector!r} has no supported samples in the frozen benchmark; "
             f"unsupported sample IDs: {', '.join(map(str, unsupported[:5]))}"
         )
-    if measurement_profile["batch_size"] > 1 and not capability_summary.get("batching"):
-        raise ValueError(f"Model {selector!r} does not support the requested batch size")
+    if measurement_profile["batch_size"] > 1:
+        raise ValueError(
+            "batch_size greater than 1 is not supported until the execution scheduler "
+            "implements batched inference"
+        )
     if concurrency > 1 and not capability_summary.get("concurrency_safe"):
         raise ValueError(f"Model {selector!r} does not support concurrent requests")
     return unsupported
@@ -468,7 +471,7 @@ def _validate_url(base_url):
 def _controls(provider, options, settings, info):
     requested = dict(options, **settings)
     supported = {
-        "ollama": {"num_predict", "temperature", "seed"},
+        "ollama": {"num_predict", "temperature", "seed", "streaming"},
         "trocr": {"num_predict", "num_beams", "device", "revision"},
         "openai": {"num_predict", "image_detail", "reasoning_effort"},
         "chatgpt": {"image_detail", "reasoning_effort"},

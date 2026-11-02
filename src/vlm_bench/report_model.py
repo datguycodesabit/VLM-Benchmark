@@ -18,7 +18,7 @@ from typing import Any
 
 from .equivalence import EQUIVALENCE_VERSION, compare_equations
 from .metrics import normalize_text, score
-from .ranking import rank_track
+from .ranking import RANKING_VERSION, rank_track
 from .research import (
     _has_document_metadata,
     _model_name,
@@ -31,9 +31,10 @@ from .research import (
 )
 from .scoring_policy import ScoringPolicy
 
-REPORT_MODEL_VERSION = 1
+REPORT_MODEL_VERSION = 2
 EVALUATION_SCHEMA_VERSION = 2
 _TERMINAL_RUN_STATUSES = {"complete", "complete_with_errors", "completed", "success"}
+_MAX_BOOTSTRAP_REPLICATES = 10_000
 
 
 def _finite_nonnegative(value: Any) -> float | None:
@@ -104,6 +105,28 @@ def _configured_models(
     return result
 
 
+def _declared_unsupported_ids(
+    manifest: Mapping[str, Any], model: str, known_sample_ids: set[str]
+) -> set[str]:
+    declarations = manifest.get("unsupported_sample_ids")
+    if declarations is None:
+        return set()
+    if not isinstance(declarations, Mapping):
+        raise ValueError("manifest unsupported_sample_ids must map model names to sample IDs")
+    values = declarations.get(model, [])
+    if not isinstance(values, Sequence) or isinstance(values, (str, bytes)):
+        raise ValueError(f"unsupported_sample_ids for {model!r} must be a list of sample IDs")
+    if any(not isinstance(value, str) or not value for value in values):
+        raise ValueError(f"unsupported_sample_ids for {model!r} contains an invalid sample ID")
+    result = set(values)
+    if not result.issubset(known_sample_ids):
+        unknown = sorted(result - known_sample_ids)
+        raise ValueError(
+            f"unsupported_sample_ids for {model!r} references unknown samples: {unknown}"
+        )
+    return result
+
+
 def _key(record: Mapping[str, Any]) -> tuple[str, int, str]:
     model = _model_name(record.get("model"))
     sample_id = record.get("sample_id")
@@ -153,6 +176,8 @@ def _cell(
     record: Mapping[str, Any] | None,
     sample: Mapping[str, Any],
     track: str,
+    *,
+    unsupported_is_declared: bool = False,
 ) -> tuple[dict[str, Any], str, str | None]:
     reference = sample.get("reference")
     if not isinstance(reference, str) or not normalize_text(reference):
@@ -170,7 +195,7 @@ def _cell(
             "missing",
             None,
         )
-    if record.get("status") == "unsupported":
+    if record.get("status") == "unsupported" and unsupported_is_declared:
         return {}, "unsupported", None
     prediction = record.get("prediction")
     if record.get("status") == "success" and isinstance(prediction, str):
@@ -274,10 +299,46 @@ def _aggregate_pass(
             else None,
             "latency_rank_eligible": speed_comparable,
             "terminal_complete": not missing_ids,
-            "timing_observations": timing_observations,
+            "timing_observations": _summarize_observations(timing_observations),
+            "timing_observation_storage": "raw observations remain in results.jsonl",
         }
     )
     return aggregate, latencies, missing_ids, failed_ids, success_count, cache_hits, empty_count
+
+
+def _summarize_observations(records):
+    """Bound derived timing detail by metric/provenance, not by image count."""
+    groups = {}
+    for record in records:
+        observation = record["observation"]
+        fields = (
+            "metric_name",
+            "unit",
+            "source",
+            "start_boundary",
+            "end_boundary",
+            "unavailable_reason",
+        )
+        key = tuple(observation.get(name) for name in fields)
+        group = groups.setdefault(key, {**dict(zip(fields, key)), "values": [], "count": 0})
+        group["count"] += 1
+        value = _finite_nonnegative(observation.get("value"))
+        if value is not None:
+            group["values"].append(value)
+    result = []
+    for key in sorted(groups, key=str):
+        group = groups[key]
+        values = group.pop("values")
+        result.append(
+            {
+                **group,
+                "value": statistics.median(values) if values else None,
+                "p95": _percentile(values, 0.95),
+                "measured_count": len(values),
+                "aggregation": "median",
+            }
+        )
+    return result
 
 
 def _percentile(values: Sequence[float], quantile: float) -> float | None:
@@ -410,6 +471,7 @@ def _throughput_summary(manifest: Mapping[str, Any]) -> dict[str, Any]:
     total_terminal: int | None = 0
     numerator_labels: set[str] = set()
     denominator_labels: set[str] = set()
+    terminal_numerator_labels: set[str] = set()
     for run in runs:
         if not isinstance(run, Mapping):
             continue
@@ -424,6 +486,7 @@ def _throughput_summary(manifest: Mapping[str, Any]) -> dict[str, Any]:
         ]
         wall_seconds = sum(durations)
         total_wall += wall_seconds
+        duration_complete = len(durations) == len(valid_invocations) and bool(valid_invocations)
         terminal_record = next(
             (
                 item
@@ -444,7 +507,7 @@ def _throughput_summary(manifest: Mapping[str, Any]) -> dict[str, Any]:
             if terminal_record is not None
             else None
         )
-        complete = terminal_record is not None and wall_seconds > 0
+        complete = terminal_record is not None and duration_complete and wall_seconds > 0
         all_complete = all_complete and complete
         if successful is None or terminal is None:
             total_successful = None
@@ -454,16 +517,22 @@ def _throughput_summary(manifest: Mapping[str, Any]) -> dict[str, Any]:
             total_terminal += terminal
         numerator = terminal_record.get("throughput_numerator") if terminal_record else None
         denominator = terminal_record.get("throughput_denominator") if terminal_record else None
+        terminal_numerator = (
+            terminal_record.get("terminal_throughput_numerator") if terminal_record else None
+        )
         if isinstance(numerator, str):
             numerator_labels.add(numerator)
         if isinstance(denominator, str):
             denominator_labels.add(denominator)
+        if isinstance(terminal_numerator, str):
+            terminal_numerator_labels.add(terminal_numerator)
         run_summaries.append(
             {
                 "pass": run.get("pass"),
                 "run_id": run.get("run_id"),
                 "invocation_count": len(valid_invocations),
                 "workload_wall_seconds": wall_seconds if durations else None,
+                "workload_duration_complete": duration_complete,
                 "successful_sample_count": successful,
                 "terminal_sample_count": terminal,
                 "successful_samples_per_second": (
@@ -475,6 +544,7 @@ def _throughput_summary(manifest: Mapping[str, Any]) -> dict[str, Any]:
                 "status": "available" if complete else "partial",
                 "throughput_numerator": numerator,
                 "throughput_denominator": denominator,
+                "terminal_throughput_numerator": terminal_numerator,
                 "invocations": [dict(item) for item in valid_invocations],
             }
         )
@@ -509,6 +579,9 @@ def _throughput_summary(manifest: Mapping[str, Any]) -> dict[str, Any]:
         else None,
         "throughput_denominator": next(iter(denominator_labels))
         if len(denominator_labels) == 1
+        else None,
+        "terminal_throughput_numerator": next(iter(terminal_numerator_labels))
+        if len(terminal_numerator_labels) == 1
         else None,
         "runs": run_summaries,
     }
@@ -576,6 +649,7 @@ def evaluate_run(
     *,
     bootstrap_replicates: int = 250,
     bootstrap_seed: int = 42,
+    scoring_policy_source: str | None = None,
 ) -> dict[str, Any]:
     """Evaluate offline evidence with failure penalties and separate track ranks."""
     if (
@@ -590,17 +664,48 @@ def evaluate_run(
         or bootstrap_replicates < 1
     ):
         raise ValueError("bootstrap_replicates must be a positive integer")
+    if bootstrap_replicates > _MAX_BOOTSTRAP_REPLICATES:
+        raise ValueError(f"bootstrap_replicates cannot exceed {_MAX_BOOTSTRAP_REPLICATES}")
     if isinstance(bootstrap_seed, bool) or not isinstance(bootstrap_seed, int):
         raise TypeError("bootstrap_seed must be an integer")
     if not isinstance(run_status, str) or not run_status:
         raise ValueError("run_status must be a non-empty string")
-    selected_policy = (
-        policy if isinstance(policy, ScoringPolicy) else ScoringPolicy.from_dict(policy)
-    )
+    explicit_policy = policy is not None
     manifest_values = dict(manifest or {})
+    manifest_policy = manifest_values.get("scoring_policy")
+    selected_policy = (
+        ScoringPolicy.from_dict(manifest_policy)
+        if policy is None and isinstance(manifest_policy, Mapping)
+        else policy
+        if isinstance(policy, ScoringPolicy)
+        else ScoringPolicy.from_dict(policy)
+    )
     version = manifest_values.get("evaluation_schema_version")
-    if version not in (None, EVALUATION_SCHEMA_VERSION):
+    if version is not None and (type(version) is not int or version != EVALUATION_SCHEMA_VERSION):
         raise ValueError(f"unsupported evaluation schema version: {version!r}")
+
+    stored_policy = manifest_values.get("scoring_policy")
+    if isinstance(stored_policy, Mapping):
+        stored_policy = ScoringPolicy.from_dict(stored_policy)
+    else:
+        stored_policy = None
+    policy_source = (
+        "explicit_override"
+        if explicit_policy and stored_policy is not None and selected_policy != stored_policy
+        else "frozen_manifest"
+        if stored_policy is not None
+        else "explicit_override"
+        if explicit_policy
+        else "evaluator_default"
+    )
+    if scoring_policy_source is not None:
+        if scoring_policy_source not in {
+            "frozen_manifest",
+            "explicit_override",
+            "evaluator_default",
+        }:
+            raise ValueError(f"unsupported scoring_policy_source: {scoring_policy_source!r}")
+        policy_source = scoring_policy_source
 
     frozen: dict[str, dict[str, Any]] = {}
     for index, raw in enumerate(samples, start=1):
@@ -661,22 +766,19 @@ def evaluate_run(
         eligible_ids = sorted(eligible)
         model_rows: list[dict[str, Any]] = []
         track_cells: dict[tuple[str, int, str], tuple[dict[str, Any], str, str | None]] = {}
+        inconsistent_unsupported_samples: list[dict[str, Any]] = []
         for model in model_names:
             reason = _unsupported_reason(capability_manifest, model, track)
-            unsupported_ids = {
-                sample_id
-                for sample_id in eligible_ids
-                if any(
-                    indexed.get((model, pass_index, sample_id), {}).get("status") == "unsupported"
-                    for pass_index in range(1, planned_passes + 1)
-                )
-            }
             if reason:
                 model_rows.append(
                     {
                         "model": model,
                         "status": "unsupported",
                         "unsupported_reason": reason,
+                        "unsupported_sample_ids": [],
+                        "unsupported_sample_count": 0,
+                        "inconsistent_unsupported_sample_ids": [],
+                        "inconsistent_unsupported_sample_count": 0,
                         "eligible_sample_count": 0,
                         "eligible_sample_ids": [],
                         "score": None,
@@ -685,6 +787,30 @@ def evaluate_run(
                     }
                 )
                 continue
+            declared_unsupported = _declared_unsupported_ids(manifest_values, model, set(frozen))
+            unsupported_ids = declared_unsupported.intersection(eligible_ids)
+            inconsistent_ids: set[str] = set()
+            for sample_id in eligible_ids:
+                if sample_id in declared_unsupported:
+                    continue
+                unsupported_passes = [
+                    pass_index
+                    for pass_index in range(1, planned_passes + 1)
+                    if indexed.get((model, pass_index, sample_id), {}).get("status")
+                    == "unsupported"
+                ]
+                if len(unsupported_passes) == planned_passes:
+                    unsupported_ids.add(sample_id)
+                elif unsupported_passes:
+                    inconsistent_ids.add(sample_id)
+                    inconsistent_unsupported_samples.append(
+                        {
+                            "model": model,
+                            "sample_id": sample_id,
+                            "unsupported_passes": unsupported_passes,
+                            "planned_passes": planned_passes,
+                        }
+                    )
             model_ids = [
                 sample_id for sample_id in eligible_ids if sample_id not in unsupported_ids
             ]
@@ -698,6 +824,8 @@ def evaluate_run(
                         else None,
                         "unsupported_sample_ids": sorted(unsupported_ids),
                         "unsupported_sample_count": len(unsupported_ids),
+                        "inconsistent_unsupported_sample_ids": [],
+                        "inconsistent_unsupported_sample_count": 0,
                         "eligible_sample_count": 0,
                         "eligible_sample_ids": [],
                         "score": None,
@@ -708,7 +836,10 @@ def evaluate_run(
                 continue
             cell_cache = {
                 (model, pass_index, sample_id): _cell(
-                    indexed.get((model, pass_index, sample_id)), eligible[sample_id], track
+                    indexed.get((model, pass_index, sample_id)),
+                    eligible[sample_id],
+                    track,
+                    unsupported_is_declared=sample_id in unsupported_ids,
                 )
                 for pass_index in range(1, planned_passes + 1)
                 for sample_id in model_ids
@@ -746,14 +877,23 @@ def evaluate_run(
                 cache_hits += pass_cache
                 empty += pass_empty
                 all_terminal = all_terminal and result["terminal_complete"]
+            all_terminal = all_terminal and not inconsistent_ids
             pass_scores = [float(row["score"]) for row in per_pass if row.get("score") is not None]
             total_expected = len(model_ids) * planned_passes
             row: dict[str, Any] = {
                 "model": model,
-                "status": "complete" if all_terminal and run_is_complete else "incomplete",
+                "status": (
+                    "eligibility_inconsistent"
+                    if inconsistent_ids
+                    else "complete"
+                    if all_terminal and run_is_complete
+                    else "incomplete"
+                ),
                 "unsupported_reason": None,
                 "unsupported_sample_ids": sorted(unsupported_ids),
                 "unsupported_sample_count": len(unsupported_ids),
+                "inconsistent_unsupported_sample_ids": sorted(inconsistent_ids),
+                "inconsistent_unsupported_sample_count": len(inconsistent_ids),
                 "eligible_sample_count": len(model_ids),
                 "eligible_sample_ids": model_ids,
                 "expected_sample_pass_count": total_expected,
@@ -884,6 +1024,7 @@ def evaluate_run(
             "eligible_sample_count": len(eligible_ids),
             "excluded_samples": [row for row in exclusions if row["track"] == track],
             "roster_compatible": roster_compatible,
+            "inconsistent_unsupported_samples": inconsistent_unsupported_samples,
             "measurement_profile": manifest_values.get(
                 "measurement_profile", {"profile": "latency", "concurrency": 1}
             ),
@@ -896,13 +1037,15 @@ def evaluate_run(
             "uncertainty": uncertainty,
         }
 
-    identity = {
+    raw_evidence_id = _raw_evidence_id(
+        list(frozen.values()), raw_records, model_names, manifest_values, planned_passes
+    )
+    evaluation_configuration = {
         "evaluation_schema_version": EVALUATION_SCHEMA_VERSION,
         "report_model_version": REPORT_MODEL_VERSION,
+        "ranking_version": RANKING_VERSION,
         "equivalence_version": EQUIVALENCE_VERSION,
-        "samples": list(samples),
-        "records": list(records),
-        "models": model_names,
+        "raw_evidence_id": raw_evidence_id,
         "policy": selected_policy.to_dict(),
         "planned_passes": planned_passes,
         "run_status": run_status,
@@ -913,17 +1056,24 @@ def evaluate_run(
             "confidence_level": 0.95,
             "missing_documents": "unavailable",
         },
-        "execution_evidence": manifest_values.get(
-            "execution_runs", manifest_values.get("execution_summary")
-        ),
     }
     throughput = _throughput_summary(manifest_values)
     return {
         "schema_version": REPORT_MODEL_VERSION,
         "report_model_version": REPORT_MODEL_VERSION,
         "evaluation_schema_version": EVALUATION_SCHEMA_VERSION,
-        "evaluation_id": _canonical_hash(identity),
+        "ranking_version": RANKING_VERSION,
+        "raw_evidence_id": raw_evidence_id,
+        "evaluation_id": _canonical_hash(evaluation_configuration),
         "policy": selected_policy.to_dict(),
+        "provenance": {
+            "raw_evidence_id": raw_evidence_id,
+            "derived_from_raw_evidence_id": raw_evidence_id,
+            "rescore_of": raw_evidence_id if policy_source == "explicit_override" else None,
+            "scoring_policy_source": policy_source,
+            "legacy_scoring_version": manifest_values.get("scoring_version"),
+            "benchmark_fingerprint": manifest_values.get("benchmark_fingerprint"),
+        },
         "planned_passes": planned_passes,
         "run_status": run_status,
         "throughput": throughput,
@@ -944,6 +1094,83 @@ def _canonical_hash(value: Any) -> str:
         default=str,
     ).encode("utf-8")
     return hashlib.sha256(encoded).hexdigest()
+
+
+_RAW_MANIFEST_FIELDS = (
+    "benchmark_fingerprint",
+    "models",
+    "model_info",
+    "model_capabilities",
+    "unsupported_sample_ids",
+    "settings",
+    "provider_controls",
+    "preprocess",
+    "layout",
+    "split",
+    "strict_research",
+    "protocol",
+    "formula_rendering",
+    "task_metrics_version",
+    "formula_renderer",
+    "prompt_version",
+    "prompt_hashes",
+    "prose_prompt_hash",
+    "math_prompt_hash",
+    "base_url",
+    "timeout",
+    "options",
+    "max_retries",
+    "concurrency",
+    "max_requests",
+    "max_spend_usd",
+    "measurement_profile",
+    "measurement_schema_version",
+    "planned_passes",
+    "repetition",
+    "repeated_measurement",
+    "suite_condition",
+    "host",
+    "environment",
+    "execution_controls",
+)
+
+
+def _raw_evidence_id(
+    samples: Sequence[Mapping[str, Any]],
+    records: Sequence[Mapping[str, Any]],
+    models: Sequence[str],
+    manifest: Mapping[str, Any],
+    planned_passes: int,
+) -> str:
+    raw_records: list[dict[str, Any]] = []
+    for record in records:
+        raw_records.append(
+            {str(key): value for key, value in record.items() if str(key).lower() != "metrics"}
+        )
+    raw_records.sort(
+        key=lambda row: (
+            _model_name(row.get("model")) or "",
+            _record_pass(row),
+            str(row.get("sample_id", "")),
+        )
+    )
+    frozen_samples = sorted(
+        (dict(sample) for sample in samples), key=lambda sample: str(sample.get("id", ""))
+    )
+    inference_identity = {key: manifest[key] for key in _RAW_MANIFEST_FIELDS if key in manifest}
+    execution = manifest.get("execution_runs", manifest.get("execution_summary"))
+    if execution is not None:
+        inference_identity["execution_evidence"] = execution
+    return _canonical_hash(
+        {
+            "raw_evidence_schema_version": 1,
+            "samples": frozen_samples,
+            "records": raw_records,
+            "models": sorted(set(models)),
+            "planned_passes": planned_passes,
+            "inference_identity": inference_identity,
+        }
+    )
 
 
 _PATH_EVIDENCE_FIELDS = {
@@ -1026,6 +1253,21 @@ def _policy_for_source(
     return value if isinstance(value, ScoringPolicy) else ScoringPolicy.from_dict(value)
 
 
+def _explicit_policy_override(
+    explicit: ScoringPolicy | Mapping[str, Any] | None,
+    frozen: ScoringPolicy | Mapping[str, Any] | None,
+) -> str | None:
+    if explicit is None:
+        return None
+    selected = (
+        explicit if isinstance(explicit, ScoringPolicy) else ScoringPolicy.from_dict(explicit)
+    )
+    if frozen is None:
+        return "explicit_override"
+    stored = frozen if isinstance(frozen, ScoringPolicy) else ScoringPolicy.from_dict(frozen)
+    return "explicit_override" if selected != stored else None
+
+
 def _load_json_object(path: Path) -> dict[str, Any]:
     try:
         value = json.loads(path.read_text(encoding="utf-8"))
@@ -1044,7 +1286,25 @@ def _evaluate_runs(
     *,
     declared_status: str | None = None,
     expected_fingerprint: str | None = None,
+    scoring_policy_source: str | None = None,
 ) -> dict[str, Any] | None:
+    if len(run_dirs) != len(pass_indices):
+        raise ValueError("run paths and pass identities must have matching lengths")
+    if len(set(run_dirs)) != len(run_dirs):
+        raise ValueError("multiple passes cannot reference the same physical run")
+    if (
+        isinstance(planned_passes, bool)
+        or not isinstance(planned_passes, int)
+        or planned_passes < 1
+    ):
+        raise ValueError("planned_passes must be a positive integer")
+    if any(
+        isinstance(index, bool) or not isinstance(index, int) or not 1 <= index <= planned_passes
+        for index in pass_indices
+    ):
+        raise ValueError("pass identities must be positive integers within planned_passes")
+    if len(set(pass_indices)) != len(pass_indices):
+        raise ValueError("run pass identities must be unique")
     manifests: list[dict[str, Any]] = []
     records: list[dict[str, Any]] = []
     samples: list[dict[str, Any]] | None = None
@@ -1056,14 +1316,17 @@ def _evaluate_runs(
         manifest, run_records = _load_validated_run(run_dir)
         _validate_evaluation_schema(manifest)
         run_planned = manifest.get("planned_passes")
-        if run_planned is not None and run_planned != planned_passes:
+        if run_planned is not None and (
+            isinstance(run_planned, bool)
+            or not isinstance(run_planned, int)
+            or run_planned != planned_passes
+        ):
             raise ValueError(f"planned_passes changed between experiment and run {run_dir}")
         run_repetition = manifest.get("repetition")
-        if (
-            run_repetition is not None
-            and not isinstance(run_repetition, bool)
-            and isinstance(run_repetition, int)
-            and run_repetition != pass_index
+        if run_repetition is not None and (
+            isinstance(run_repetition, bool)
+            or not isinstance(run_repetition, int)
+            or run_repetition != pass_index
         ):
             raise ValueError(f"run repetition does not match its experiment pass: {run_dir}")
         if (
@@ -1085,6 +1348,7 @@ def _evaluate_runs(
                 "provider_controls",
                 "model_info",
                 "model_capabilities",
+                "unsupported_sample_ids",
                 "measurement_profile",
                 "measurement_schema_version",
                 "planned_passes",
@@ -1137,13 +1401,43 @@ def _evaluate_runs(
         records.extend({**row, "pass": pass_index} for row in run_records)
     if samples is None:
         return None
+    run_manifest = dict(manifests[0])
+    run_manifest["models"] = model_names or []
+    run_manifest["execution_runs"] = [
+        {
+            "pass": pass_index,
+            "run_id": str(run_dir),
+            "invocations": (
+                (manifest.get("execution_summary") or {}).get("invocations", [])
+                if isinstance(manifest.get("execution_summary"), Mapping)
+                else []
+            ),
+        }
+        for run_dir, pass_index, manifest in zip(run_dirs, pass_indices, manifests, strict=True)
+    ]
+    run_manifest["planned_passes"] = planned_passes
     if selected_policy is None:
+        raw_evidence_id = _raw_evidence_id(
+            samples, records, model_names or [], run_manifest, planned_passes
+        )
         return {
             "status": "legacy_policy_unavailable",
             "evaluation": None,
             "legacy_scoring_version": manifests[0].get("scoring_version"),
             "reason": "run has no versioned weighted scoring policy; pass an explicit policy to re-evaluate",
+            "raw_evidence_id": raw_evidence_id,
+            "provenance": {"raw_evidence_id": raw_evidence_id},
         }
+    effective_policy_source = scoring_policy_source
+    if effective_policy_source == "explicit_override" and manifests:
+        frozen_run_policies = [
+            ScoringPolicy.from_dict(manifest["scoring_policy"])
+            if isinstance(manifest.get("scoring_policy"), Mapping)
+            else None
+            for manifest in manifests
+        ]
+        if all(candidate == selected_policy for candidate in frozen_run_policies):
+            effective_policy_source = "frozen_manifest"
     runs_complete = len(run_dirs) == planned_passes and all(
         status.lower() in _TERMINAL_RUN_STATUSES for status in statuses
     )
@@ -1157,22 +1451,8 @@ def _evaluate_runs(
             if declared_status.lower() not in _TERMINAL_RUN_STATUSES
             else "incomplete"
         )
-    run_manifest = dict(manifests[0])
-    run_manifest["models"] = model_names or []
     run_manifest["evaluation_schema_version"] = EVALUATION_SCHEMA_VERSION
     run_manifest.setdefault("scoring_policy", selected_policy.to_dict())
-    run_manifest["execution_runs"] = [
-        {
-            "pass": pass_index,
-            "run_id": str(run_dir),
-            "invocations": (
-                (manifest.get("execution_summary") or {}).get("invocations", [])
-                if isinstance(manifest.get("execution_summary"), Mapping)
-                else []
-            ),
-        }
-        for run_dir, pass_index, manifest in zip(run_dirs, pass_indices, manifests, strict=True)
-    ]
     return evaluate_run(
         samples,
         records,
@@ -1181,6 +1461,7 @@ def _evaluate_runs(
         planned_passes=planned_passes,
         run_status=effective_status,
         manifest=run_manifest,
+        scoring_policy_source=effective_policy_source,
     )
 
 
@@ -1198,27 +1479,114 @@ def _wrap_report(
             name: value.get("evaluation_id") if isinstance(value, Mapping) else None
             for name, value in conditions.items()
         },
+        "condition_raw_evidence": {
+            name: value.get("raw_evidence_id") if isinstance(value, Mapping) else None
+            for name, value in conditions.items()
+        },
         "benchmark_fingerprint": (manifest or {}).get("benchmark_fingerprint"),
     }
+    raw_evidence_id = _canonical_hash(
+        {
+            name: value.get("raw_evidence_id")
+            for name, value in sorted(conditions.items())
+            if isinstance(value, Mapping) and value.get("raw_evidence_id") is not None
+        }
+    )
     return {
         "schema_version": REPORT_MODEL_VERSION,
         "report_model_version": REPORT_MODEL_VERSION,
         "evaluation_schema_version": EVALUATION_SCHEMA_VERSION,
+        "ranking_version": RANKING_VERSION,
         "evaluation_id": _canonical_hash(identity),
+        "raw_evidence_id": raw_evidence_id,
+        "provenance": {"raw_evidence_id": raw_evidence_id},
         "source": {"type": source_type, "path": str(path)},
         "policy": policy.to_dict() if policy is not None else None,
         "conditions": dict(conditions),
     }
 
 
-def _legacy_unavailable(manifest: Mapping[str, Any], planned_passes: int) -> dict[str, Any]:
+def _legacy_unavailable(
+    manifest: Mapping[str, Any], planned_passes: int, raw_evidence_id: str
+) -> dict[str, Any]:
     return {
         "status": "legacy_policy_unavailable",
         "evaluation": None,
         "legacy_scoring_version": manifest.get("scoring_version"),
         "planned_passes": planned_passes,
         "reason": "run has no versioned weighted scoring policy; pass an explicit policy to re-evaluate",
+        "raw_evidence_id": raw_evidence_id,
+        "provenance": {"raw_evidence_id": raw_evidence_id},
     }
+
+
+def _evaluate_unstarted_experiment(
+    plan: Mapping[str, Any],
+    prepared: Path,
+    planned_passes: int,
+    policy: ScoringPolicy | None,
+) -> dict[str, Any]:
+    from .snapshot import load as load_snapshot
+
+    snapshot = load_snapshot(prepared)
+    run_kwargs = plan["run_kwargs"]
+    manifest: dict[str, Any] = {
+        "benchmark_fingerprint": plan["benchmark_fingerprint"],
+        "models": list(plan["models"]),
+        "planned_passes": planned_passes,
+        "status": "incomplete",
+        "preprocess": snapshot.get("preprocess"),
+        "layout": snapshot.get("layout"),
+        "split": snapshot.get("split"),
+        "strict_research": run_kwargs.get("strict_research"),
+        "protocol": run_kwargs.get("protocol"),
+        "formula_rendering": run_kwargs.get("formula_rendering"),
+        "settings": run_kwargs.get("settings", {}),
+        "costs": run_kwargs.get("costs"),
+        "base_url": run_kwargs.get("base_url"),
+        "timeout": run_kwargs.get("timeout"),
+        "warmup": run_kwargs.get("warmup"),
+        "max_retries": run_kwargs.get("max_retries"),
+        "concurrency": run_kwargs.get("concurrency", 1),
+        "max_requests": run_kwargs.get("max_requests"),
+        "max_spend_usd": run_kwargs.get("max_spend_usd"),
+        "cache_dir": run_kwargs.get("cache_dir"),
+        "measurement_profile": run_kwargs.get("measurement_profile"),
+        "frozen_source_audit": run_kwargs.get("frozen_source_audit"),
+        "frozen_validation_scope": run_kwargs.get("frozen_validation_scope"),
+    }
+    for source_key, target_key in (
+        ("prose_prompt", "prose_prompt_hash"),
+        ("math_prompt", "math_prompt_hash"),
+    ):
+        prompt = run_kwargs.get(source_key)
+        if isinstance(prompt, str):
+            manifest[target_key] = hashlib.sha256(prompt.encode("utf-8")).hexdigest()
+    if isinstance(run_kwargs.get("scoring_policy"), Mapping):
+        manifest["scoring_policy"] = dict(run_kwargs["scoring_policy"])
+    if policy is None:
+        raw_evidence_id = _raw_evidence_id(
+            snapshot.get("samples", []), [], plan["models"], manifest, planned_passes
+        )
+        return {
+            "status": "legacy_policy_unavailable",
+            "evaluation": None,
+            "planned_passes": planned_passes,
+            "legacy_scoring_version": None,
+            "reason": "frozen experiment plan has no versioned weighted scoring policy",
+            "raw_evidence_id": raw_evidence_id,
+            "provenance": {"raw_evidence_id": raw_evidence_id},
+        }
+    manifest["evaluation_schema_version"] = EVALUATION_SCHEMA_VERSION
+    return evaluate_run(
+        snapshot.get("samples", []),
+        [],
+        models=plan["models"],
+        policy=policy,
+        planned_passes=planned_passes,
+        run_status="incomplete",
+        manifest=manifest,
+    )
 
 
 def _single_run_records(
@@ -1259,10 +1627,18 @@ def build_report(
             if isinstance(planned, bool) or not isinstance(planned, int) or planned < 1:
                 raise ValueError("run planned_passes must be a positive integer")
             if selected_policy is None:
+                direct_records = _single_run_records(records, manifest)
+                raw_evidence_id = _raw_evidence_id(
+                    manifest["samples"],
+                    direct_records,
+                    [_model_name(item) for item in manifest.get("models", []) if _model_name(item)],
+                    manifest,
+                    planned,
+                )
                 return _wrap_report(
                     path,
                     "run",
-                    {"baseline": _legacy_unavailable(manifest, planned)},
+                    {"baseline": _legacy_unavailable(manifest, planned, raw_evidence_id)},
                     None,
                     manifest,
                 )
@@ -1279,6 +1655,11 @@ def build_report(
 
     if path.name == "experiment.json":
         manifest = _load_json_object(path)
+        from .experiments import _run_path, _state_for
+
+        _state_path, state = _state_for(path.parent)
+        if state != manifest:
+            raise ValueError("Experiment state changed while loading the report source")
         _validate_evaluation_schema(manifest)
         selected_policy = _policy_for_source(policy, manifest, allow_missing_versioned_policy=True)
         planned = manifest.get("planned_passes", 1)
@@ -1287,6 +1668,29 @@ def build_report(
         entries = manifest.get("runs", [])
         if not isinstance(entries, list):
             raise ValueError("experiment runs must be a list")
+        if not entries and state.get("plan") is not None:
+            from .experiments import _validated_plan
+
+            validated_plan = _validated_plan(path.parent, state)
+            if validated_plan is None:  # pragma: no cover - guarded by state.get above
+                raise ValueError("Experiment has no validated frozen plan")
+            plan, prepared = validated_plan
+            run_kwargs = plan.get("run_kwargs", {})
+            plan_policy = run_kwargs.get("scoring_policy")
+            if "scoring_policy" in run_kwargs and not isinstance(plan_policy, Mapping):
+                raise ValueError("Frozen experiment scoring_policy must be a mapping")
+            if selected_policy is None and isinstance(plan_policy, Mapping):
+                selected_policy = ScoringPolicy.from_dict(plan_policy)
+            if (
+                selected_policy is None
+                and manifest.get("evaluation_schema_version") == EVALUATION_SCHEMA_VERSION
+            ):
+                raise ValueError("evaluation schema 2 experiment plan has no scoring_policy")
+            condition = str(manifest.get("condition", "baseline"))
+            evaluation = _evaluate_unstarted_experiment(plan, prepared, planned, selected_policy)
+            return _wrap_report(
+                path, "experiment", {condition: evaluation}, selected_policy, manifest
+            )
         run_dirs: list[Path] = []
         pass_indices: list[int] = []
         for index, item in enumerate(entries, start=1):
@@ -1299,9 +1703,7 @@ def build_report(
                     raise ValueError("experiment run entries need a run_dir or path")
             else:
                 raise ValueError("experiment run entries must be paths or mappings")
-            run_dir = Path(raw_path)
-            if not run_dir.is_absolute():
-                run_dir = (path.parent / run_dir).resolve()
+            run_dir = _run_path(raw_path, path.parent)
             if (
                 isinstance(pass_index, bool)
                 or not isinstance(pass_index, int)
@@ -1319,6 +1721,7 @@ def build_report(
             selected_policy,
             declared_status=manifest.get("status"),
             expected_fingerprint=manifest.get("benchmark_fingerprint"),
+            scoring_policy_source=_explicit_policy_override(policy, manifest.get("scoring_policy")),
         )
         condition = str(manifest.get("condition", "baseline"))
         if selected_policy is None and evaluation and isinstance(evaluation.get("policy"), Mapping):
@@ -1333,10 +1736,14 @@ def build_report(
         return _wrap_report(path, "experiment", conditions, selected_policy, manifest)
 
     if path.name == "suite.json":
-        from .suite import _read_manifest
+        from .suite import _read_manifest, _validate_run_records
 
         manifest = _read_manifest(path)
         _validate_evaluation_schema(manifest)
+        normalized_suite = manifest.get("normalized_suite")
+        if not isinstance(normalized_suite, Mapping):
+            raise ValueError("Suite manifest has no normalized_suite for validating run paths")
+        _validate_run_records(manifest, dict(normalized_suite), path.parent)
         selected_policy = _policy_for_source(policy, manifest, allow_missing_versioned_policy=True)
         report_policy = selected_policy
         inferred_policies: list[ScoringPolicy] = []
@@ -1380,6 +1787,10 @@ def build_report(
                 planned,
                 condition_policy,
                 expected_fingerprint=condition.get("benchmark_fingerprint"),
+                scoring_policy_source=_explicit_policy_override(
+                    policy,
+                    condition.get("scoring_policy", manifest.get("scoring_policy")),
+                ),
             )
             conditions[name] = (
                 evaluation
@@ -1403,8 +1814,20 @@ def build_report(
     if isinstance(planned, bool) or not isinstance(planned, int) or planned < 1:
         raise ValueError("run planned_passes must be a positive integer")
     if selected_policy is None:
+        direct_records = _single_run_records(records, manifest)
+        raw_evidence_id = _raw_evidence_id(
+            manifest["samples"],
+            direct_records,
+            [_model_name(item) for item in manifest.get("models", []) if _model_name(item)],
+            manifest,
+            planned,
+        )
         return _wrap_report(
-            path, "run", {"baseline": _legacy_unavailable(manifest, planned)}, None, manifest
+            path,
+            "run",
+            {"baseline": _legacy_unavailable(manifest, planned, raw_evidence_id)},
+            None,
+            manifest,
         )
     evaluation = evaluate_run(
         manifest["samples"],

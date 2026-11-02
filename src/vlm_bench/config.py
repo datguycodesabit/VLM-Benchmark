@@ -50,6 +50,7 @@ _MODEL_SETTINGS = {
     "seed",
     "reasoning_effort",
     "image_detail",
+    "streaming",
 }
 _REASONING_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"}
 _SPLITS = {"train", "validation", "test"}
@@ -67,6 +68,7 @@ _DEFAULT_SCORING_POLICY = {
     "missing_and_failed_as_empty": True,
     "pass_aggregation": "arithmetic_mean",
     "normalization": "whitespace-v1",
+    "equation_normalization": "unicode-nfc-whitespace-v1",
 }
 _DEFAULT_MEASUREMENT_PROFILE = {
     "schema_version": 1,
@@ -121,6 +123,8 @@ def _validate_model_settings(settings: Any, context: str) -> dict[str, Any]:
         raise ValueError(f"Unsupported settings for {context}; credentials must not be in TOML")
 
     result = dict(settings)
+    if "streaming" in result and not isinstance(result["streaming"], bool):
+        raise ValueError(f"streaming for {context} must be a boolean")
     if "device" in result and (
         not isinstance(result["device"], str)
         or result["device"] not in {"auto", "cpu", "mps", "cuda", "rocm"}
@@ -194,6 +198,8 @@ def validate_settings(
             continue
         provider, _ = _selector(selector, "model settings")
         canonical_options = _validate_model_settings(options, str(selector))
+        if "streaming" in canonical_options and provider != "ollama":
+            raise ValueError("Settings streaming is only supported for provider 'ollama'")
         if provider == "external" and canonical_options:
             raise ValueError("Settings are not supported for provider 'external'")
         if provider == "trocr":
@@ -430,6 +436,8 @@ def _validate_scoring(scoring: Any) -> dict[str, Any]:
         raise ValueError("scoring.pass_aggregation must be arithmetic_mean")
     if result["normalization"] != "whitespace-v1":
         raise ValueError("scoring.normalization must be whitespace-v1")
+    if result["equation_normalization"] != "unicode-nfc-whitespace-v1":
+        raise ValueError("scoring.equation_normalization must be unicode-nfc-whitespace-v1")
     return {
         "version": 1,
         "character_accuracy_weight": character_weight,
@@ -438,6 +446,7 @@ def _validate_scoring(scoring: Any) -> dict[str, Any]:
         "missing_and_failed_as_empty": True,
         "pass_aggregation": "arithmetic_mean",
         "normalization": "whitespace-v1",
+        "equation_normalization": "unicode-nfc-whitespace-v1",
     }
 
 

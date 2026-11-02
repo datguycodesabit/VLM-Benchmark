@@ -141,3 +141,10 @@ is offline and does not add inference calls.
    accounting for local models is not an electricity/hardware cost measurement.
 11. Windows, generic hosted custom-model endpoints, distributed workers, standalone
     chart exports and slide generation remain outside the initial scope.
+
+## 2026-10-29 completion
+
+Version 0.2.0 closes the remaining command, recovery, comparison and measurement
+gaps. See [COMPLETION_REPORT.md](COMPLETION_REPORT.md) for all changes, 460 passing
+tests, and the installed CLI's 1,000-image HTTP pause/resume/report validation.
+The earlier counts and limitations above are historical.

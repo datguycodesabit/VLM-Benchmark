@@ -1,5 +1,8 @@
 # VLM Bench
 
+**0.2.0:** See the [CLI completion report](docs/COMPLETION_REPORT.md) for the
+finished command workflow, recovery, weighted comparisons and validation.
+
 For the three-pass weighted benchmark workflow, custom Python adapters, and offline
 HTML/Excel/CSV reports, see the [CLI guide](docs/CLI_GUIDE.md) and
 [update and validation report](docs/UPDATE_REPORT.md). The new policy evaluates

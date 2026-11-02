@@ -13,6 +13,7 @@ from typing import Any, Mapping
 
 SCORING_POLICY_VERSION = 1
 NORMALIZATION_VERSION = "whitespace-v1"
+EQUATION_NORMALIZATION_VERSION = "unicode-nfc-whitespace-v1"
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,6 +27,7 @@ class ScoringPolicy:
     missing_and_failed_as_empty: bool = True
     pass_aggregation: str = "arithmetic_mean"
     normalization: str = NORMALIZATION_VERSION
+    equation_normalization: str = EQUATION_NORMALIZATION_VERSION
 
     def __post_init__(self) -> None:
         if isinstance(self.version, bool) or not isinstance(self.version, int):
@@ -63,6 +65,10 @@ class ScoringPolicy:
             raise ValueError("pass_aggregation must be 'arithmetic_mean'")
         if self.normalization != NORMALIZATION_VERSION:
             raise ValueError(f"unsupported normalization version: {self.normalization!r}")
+        if self.equation_normalization != EQUATION_NORMALIZATION_VERSION:
+            raise ValueError(
+                f"unsupported equation normalization version: {self.equation_normalization!r}"
+            )
 
         # Store normalized floats even when callers supplied integers/Decimals.
         object.__setattr__(self, "character_accuracy_weight", character_weight)
@@ -77,9 +83,10 @@ class ScoringPolicy:
     def from_dict(cls, value: Mapping[str, Any] | None) -> ScoringPolicy:
         """Parse the supported manifest and configuration spellings.
 
-        ``scoring`` and ``ranking`` wrappers are accepted to make the policy
-        easy to consume from a larger configuration object. Unknown fields are
-        ignored so manifests can also carry UI-only scoring notes.
+        ``scoring_policy`` and ``scoring`` wrappers are accepted to make the
+        policy easy to consume from a larger configuration object. Unknown fields
+        raise an error so misspelled scoring controls cannot silently fall back
+        to defaults.
         """
         if value is None:
             return cls()
@@ -109,6 +116,10 @@ class ScoringPolicy:
             "missing_and_failed_as_empty": ("missing_and_failed_as_empty", "failure_penalty"),
             "pass_aggregation": ("pass_aggregation", "repetition_aggregation"),
             "normalization": ("normalization", "normalization_version"),
+            "equation_normalization": (
+                "equation_normalization",
+                "equation_normalization_version",
+            ),
         }
         accepted = {name for names in aliases.values() for name in names}
         unknown = set(value) - accepted

@@ -91,6 +91,71 @@ def test_direct_cli_three_passes_and_shared_offline_exports(tmp_path, monkeypatc
     assert len(Backend.calls) == 9
 
 
+def test_direct_cli_strict_research_freezes_test_split_before_repetitions(
+    tmp_path, monkeypatch, capsys
+):
+    data = _data(tmp_path)
+    metadata = [
+        {
+            "id": "s0",
+            "split": "train",
+            "verification_status": "verified",
+            "source_document": "train-document",
+            "writer_id": "train-writer",
+        },
+        *[
+            {
+                "id": f"s{index}",
+                "split": "test",
+                "verification_status": "verified",
+                "source_document": f"test-document-{index}",
+                "writer_id": f"test-writer-{index}",
+            }
+            for index in (1, 2)
+        ],
+    ]
+    (data / "metadata.jsonl").write_text("".join(json.dumps(record) + "\n" for record in metadata))
+    original = engine.run
+    Backend.calls = []
+    Backend.failure = None
+    Backend.identity = "fixed"
+    monkeypatch.setattr(engine, "run", lambda *a, **kw: original(*a, **kw, backend_factory=Backend))
+
+    output = tmp_path / "strict-runs"
+    assert (
+        cli.main(
+            [
+                "run",
+                "--data",
+                str(data),
+                "--models",
+                "ollama:fake",
+                "--output",
+                str(output),
+                "--strict-research",
+                "--no-warmup",
+            ]
+        )
+        == 0
+    )
+    capsys.readouterr()
+
+    experiment = next(output.iterdir())
+    state = json.loads((experiment / "experiment.json").read_text())
+    manifests = [
+        json.loads((experiment / relative / "manifest.json").read_text())
+        for relative in state["runs"]
+    ]
+    assert len(state["runs"]) == 3
+    assert len(Backend.calls) == 6
+    assert all(manifest["strict_research"] is True for manifest in manifests)
+    assert all(manifest["split"] == "test" for manifest in manifests)
+    assert all(
+        {sample["id"] for sample in manifest["samples"]} == {"s1", "s2"} for manifest in manifests
+    )
+    assert all(manifest["source_audit"]["sample_count"] == 3 for manifest in manifests)
+
+
 def test_html_escapes_predictions_and_excel_protects_formula_text(tmp_path):
     data = _data(tmp_path)
     prepared = tmp_path / "prepared"

@@ -129,3 +129,28 @@ Legacy and imported runs without a frozen weighted policy need an explicit opt-i
 `vlm-bench report --run RUN_DIRECTORY --weighted`. This writes a separate derived
 evaluation and preserves the historical results and rankings. Resume a direct
 three-pass experiment with `vlm-bench resume --run EXPERIMENT_DIRECTORY`.
+
+## 0.2.0 command completion
+
+See [COMPLETION_REPORT.md](COMPLETION_REPORT.md) for the completed workflow and
+validation. `status` and `resume` accept an experiment or suite directory as well
+as an individual run. For a relocated suite configuration, use
+`resume --run SUITE --config CONFIG.toml`.
+
+`compare` uses weighted ranking for new-policy sources. Matching suite condition
+names are compared independently; mismatched snapshots, pass counts or frozen
+policies fail clearly. `--weighted` explicitly derives default-policy scores for
+legacy sources; `--scoring-config CONFIG.toml` explicitly re-evaluates all sources
+under a v3 policy. These options also work with `report` on raw saved evidence.
+New CLI imports freeze a weighted policy by default, so they no longer need a
+second command to obtain weighted reports. Older imports remain readable.
+
+Ollama model settings can include `streaming = true` to collect client TTFO while
+buffering a complete prediction. Ollama and TrOCR rate observations include token
+count source, tokenizer/model identity when available, and special-token policy.
+Cloud prefill and decode rates stay unknown when the provider does not expose them.
+
+CSV exports now include diagnostic tables alongside `leaderboards.csv`. Reports
+can be regenerated from a saved `comparison.json` or `evaluation.json` without the
+original inference directory. Such regeneration preserves the existing evaluation;
+changing its policy requires the original raw artifacts.

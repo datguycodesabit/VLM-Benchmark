@@ -26,6 +26,8 @@ def run_status(run_dir: str | Path) -> dict[str, Any]:
     path = Path(run_dir).expanduser().resolve()
     if not path.is_dir():
         raise ValueError(f"Run directory does not exist: {path}")
+    if (path / "experiment.json").is_file() or (path / "suite.json").is_file():
+        return _experiment_status(path)
     try:
         manifest = json.loads((path / "manifest.json").read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
@@ -149,6 +151,7 @@ def run_status(run_dir: str | Path) -> dict[str, Any]:
         "created_at": manifest.get("created_at"),
         "updated_at": manifest.get("updated_at"),
         "models": model_ids,
+        "benchmark_fingerprint": manifest.get("benchmark_fingerprint"),
         "sample_count": len(sample_ids),
         "expected_result_count": len(expected),
         "recorded_result_count": len(rows),
@@ -184,4 +187,102 @@ def run_status(run_dir: str | Path) -> dict[str, Any]:
         "execution_controls": controls,
         "current_execution_controls": current_controls,
         "original_execution_controls": controls,
+    }
+
+
+def _experiment_status(path):
+    from .sources import source_plan
+
+    plan = source_plan(path)
+    children = []
+    for entry in plan["runs"]:
+        child = run_status(entry["path"])
+        children.append(
+            {"condition": entry["condition"], "repetition": entry["repetition"], **child}
+        )
+    planned_passes = sum(plan["planned"].values())
+    complete = len(children) == planned_passes and all(
+        child["run_status"] in {"complete", "complete_with_errors"}
+        and not child["missing_result_count"]
+        for child in children
+    )
+    conditions = {}
+    for condition, repeats in plan["planned"].items():
+        members = [item for item in children if item["condition"] == condition]
+        identities = {(item["benchmark_fingerprint"], tuple(item["models"])) for item in members}
+        if len(identities) > 1:
+            raise ValueError(f"Frozen dataset or models changed within condition {condition!r}")
+        expected = sum(item["expected_result_count"] for item in members)
+        if members:
+            expected += (repeats - len(members)) * members[0]["expected_result_count"]
+        else:
+            expected = None
+            if plan["manifest"].get("plan"):
+                from .snapshot import load
+
+                frozen = plan["manifest"]["plan"]
+                snapshot_path = (path / frozen["prepared"]).resolve()
+                if not snapshot_path.is_relative_to(path):
+                    raise ValueError("Experiment prepared inputs escape the source directory")
+                expected = repeats * len(load(snapshot_path)["samples"]) * len(frozen["models"])
+            for definition in plan["manifest"].get("conditions", []):
+                if definition.get("name") == condition:
+                    preview = definition.get("preview") or {}
+                    if type(preview.get("sample_count")) is int and isinstance(
+                        preview.get("models"), list
+                    ):
+                        expected = repeats * preview["sample_count"] * len(preview["models"])
+        recorded = sum(item["recorded_result_count"] for item in members)
+        conditions[condition] = {
+            "planned_passes": repeats,
+            "started_passes": len(members),
+            "completed_passes": sum(
+                item["run_status"] in {"complete", "complete_with_errors"}
+                and not item["missing_result_count"]
+                for item in members
+            ),
+            "expected_result_count": expected,
+            "recorded_result_count": recorded,
+            "missing_result_count": expected - recorded if expected is not None else None,
+        }
+    expected_values = [item["expected_result_count"] for item in conditions.values()]
+    expected = sum(expected_values) if all(value is not None for value in expected_values) else None
+    recorded = sum(item["recorded_result_count"] for item in children)
+
+    def total(key):
+        values = [item[key] for item in children]
+        return sum(values) if values and all(value is not None for value in values) else None
+
+    failures = sum(item["failed_count"] for item in children)
+    active_status = next(
+        (
+            status
+            for status in ("running", "paused", "interrupted")
+            if any(item["run_status"] == status for item in children)
+        ),
+        "incomplete",
+    )
+    return {
+        "schema_version": 1,
+        "source_type": plan["kind"],
+        "run_directory": str(path),
+        "run_status": "complete_with_errors"
+        if complete and failures
+        else "complete"
+        if complete
+        else active_status,
+        "planned_passes": planned_passes,
+        "started_passes": len(children),
+        "completed_passes": sum(item["completed_passes"] for item in conditions.values()),
+        "expected_result_count": expected,
+        "recorded_result_count": recorded,
+        "missing_result_count": expected - recorded if expected is not None else None,
+        "result_coverage": recorded / expected if expected else None,
+        "failed_count": failures,
+        "success_count": sum(item["success_count"] for item in children),
+        "generation_attempt_count_cumulative": total("generation_attempt_count_cumulative"),
+        "estimated_spend_usd_cumulative": total("estimated_spend_usd_cumulative"),
+        "unknown_spend_count_cumulative": total("unknown_spend_count_cumulative"),
+        "conditions": conditions,
+        "runs": children,
     }

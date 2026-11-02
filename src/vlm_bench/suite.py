@@ -126,33 +126,9 @@ def _run_key(condition: str, repetition: int) -> str:
 
 
 def _load_run_state(run_dir: Path) -> dict[str, Any]:
-    try:
-        manifest = json.loads((run_dir / "manifest.json").read_text(encoding="utf-8"))
-    except (OSError, ValueError) as exc:
-        raise ValueError(f"Could not read run manifest for suite run: {run_dir}") from exc
-    if not isinstance(manifest, dict):
-        raise ValueError(f"Run manifest must be a JSON object: {run_dir}")
-    if manifest.get("schema_version") != 2:
-        raise ValueError(f"Suite runs require a schema-v2 run manifest: {run_dir}")
-    immutable = {
-        key: value
-        for key, value in manifest.items()
-        if key not in {"integrity", "status", "updated_at"}
-    }
-    if (
-        not isinstance(manifest.get("integrity"), str)
-        or runner._digest(immutable) != manifest["integrity"]
-    ):
-        raise ValueError(f"Run manifest integrity check failed: {run_dir}")
-    samples = manifest.get("samples")
-    preprocess = manifest.get("preprocess")
-    if not isinstance(samples, list) or not isinstance(preprocess, str):
-        raise ValueError(f"Run manifest has no frozen benchmark identity: {run_dir}")
-    from .snapshot import fingerprint
+    from .experiments import _read_run_manifest
 
-    if fingerprint(samples, preprocess) != manifest.get("benchmark_fingerprint"):
-        raise ValueError(f"Run benchmark fingerprint does not match its frozen samples: {run_dir}")
-    return manifest
+    return _read_run_manifest(run_dir)
 
 
 def _condition_fingerprint(preview: dict[str, Any]) -> str:
@@ -178,7 +154,7 @@ def _build_report(manifest: dict[str, Any], suite_root: Path) -> dict[str, Any]:
         model_values: dict[tuple[str, str], list[dict[str, Any]]] = {}
         track_counts: dict[str, dict[str, Any]] = {}
         for entry in condition_runs:
-            run_dir = Path(entry["run_dir"])
+            run_dir = _suite_run_path(entry["run_dir"], suite_root)
             run_manifest = _load_run_state(run_dir)
             if run_manifest.get("benchmark_fingerprint") != condition["benchmark_fingerprint"]:
                 raise ValueError(
@@ -189,7 +165,7 @@ def _build_report(manifest: dict[str, Any], suite_root: Path) -> dict[str, Any]:
             summary = {
                 "repetition": entry["repetition"],
                 "run_id": run_dir.name,
-                "run_dir": str(run_dir),
+                "run_dir": _suite_run_relative(run_dir, suite_root),
                 "status": run_manifest.get("status"),
                 "benchmark_fingerprint": run_manifest.get("benchmark_fingerprint"),
                 "independent_sample_counts": {},
@@ -379,7 +355,7 @@ def _validate_run_records(
             continue
         if not isinstance(run_value, str) or not run_value:
             raise ValueError(f"Suite run record {key!r} has an invalid run directory")
-        run_dir = Path(run_value).expanduser().resolve()
+        run_dir = _suite_run_path(run_value, suite_root)
         if run_dir == runs_root or runs_root not in run_dir.parents:
             raise ValueError(f"Saved run directory escapes the suite output: {run_dir}")
         if run_dir in paths:
@@ -389,6 +365,38 @@ def _validate_run_records(
         paths.add(run_dir)
         if not run_dir.is_dir():
             raise FileNotFoundError(f"Saved suite run directory is missing: {run_dir}")
+        record["run_dir"] = _suite_run_relative(run_dir, suite_root)
+
+
+def _suite_run_path(value: str | Path, suite_root: Path) -> Path:
+    path = Path(value).expanduser()
+    if path.is_absolute() and path.exists():
+        resolved = path.resolve()
+    elif path.is_absolute():
+        markers = [index for index, part in enumerate(path.parts) if part == "runs"]
+        if not markers or markers[-1] + 1 >= len(path.parts):
+            raise FileNotFoundError(f"Saved suite run directory is missing: {path}")
+        relative = Path(*path.parts[markers[-1] + 1 :])
+        resolved = (suite_root / "runs" / relative).resolve()
+    else:
+        resolved = (suite_root / path).resolve()
+    runs_root = (suite_root / "runs").resolve()
+    try:
+        resolved.relative_to(runs_root)
+    except ValueError as exc:
+        raise ValueError(f"Saved run directory escapes the suite output: {resolved}") from exc
+    if not resolved.is_dir():
+        raise FileNotFoundError(f"Saved suite run directory is missing: {resolved}")
+    return resolved
+
+
+def _suite_run_relative(run_dir: Path, suite_root: Path) -> str:
+    resolved = run_dir.expanduser().resolve()
+    try:
+        relative = resolved.relative_to(suite_root.resolve())
+    except ValueError as exc:
+        raise ValueError(f"Run directory escapes the suite output: {resolved}") from exc
+    return relative.as_posix()
 
 
 def _verify_run_identity(
@@ -409,8 +417,39 @@ def _verify_run_identity(
         raise ValueError(f"Saved run models do not match suite condition {name!r}")
     if run_manifest.get("settings", {}) != condition.get("settings", {}):
         raise ValueError(f"Saved run settings do not match suite condition {name!r}")
+    preview_models = {
+        item.get("selector"): item
+        for item in preview.get("models", [])
+        if isinstance(item, dict) and isinstance(item.get("selector"), str)
+    }
+    manifest_info = run_manifest.get("model_info", {})
+    manifest_capabilities = run_manifest.get("model_capabilities", {})
+    manifest_controls = run_manifest.get("provider_controls", {})
+    for selector in condition["models"]:
+        expected = preview_models.get(selector)
+        if expected is None:
+            continue
+        if "model_info" in expected and manifest_info.get(selector) != expected["model_info"]:
+            raise ValueError(f"Saved run model identity changed for {selector!r} in suite {name!r}")
+        if (
+            "capabilities" in expected
+            and manifest_capabilities.get(selector) != expected["capabilities"]
+        ):
+            raise ValueError(f"Saved run capabilities changed for {selector!r} in suite {name!r}")
+        if "controls" in expected and manifest_controls.get(selector) != expected["controls"]:
+            raise ValueError(
+                f"Saved run effective controls changed for {selector!r} in suite {name!r}"
+            )
     if run_manifest.get("prompt_hashes") != preview.get("prompt_hashes"):
         raise ValueError(f"Saved run prompts do not match suite condition {name!r}")
+    if "source_audit" in preview and run_manifest.get("source_audit") != preview.get(
+        "source_audit"
+    ):
+        raise ValueError(f"Saved run source audit changed for suite condition {name!r}")
+    if "validation_scope" in preview and run_manifest.get("validation_scope") != preview.get(
+        "validation_scope"
+    ):
+        raise ValueError(f"Saved run validation scope changed for suite condition {name!r}")
     for field in (
         "scoring_policy",
         "measurement_profile",
@@ -455,6 +494,36 @@ def _verify_run_identity(
             raise ValueError(
                 f"Saved run {field} does not match suite execution controls for {name!r}"
             )
+
+
+def _discover_unrecorded_run(
+    suite_root: Path,
+    condition: dict[str, Any],
+    repetition: int,
+    preview: dict[str, Any],
+    execution_controls: dict[str, Any],
+) -> Path | None:
+    runs_root = suite_root / "runs"
+    if not runs_root.is_dir():
+        return None
+    matches: list[Path] = []
+    for candidate in runs_root.iterdir():
+        if not candidate.is_dir() or not (candidate / "manifest.json").is_file():
+            continue
+        run_manifest = _load_run_state(candidate)
+        if (
+            run_manifest.get("suite_condition") != condition["name"]
+            or run_manifest.get("repetition") != repetition
+        ):
+            continue
+        _verify_run_identity(run_manifest, condition, repetition, preview, execution_controls)
+        matches.append(candidate.resolve())
+    if len(matches) > 1:
+        raise ValueError(
+            f"Multiple unrecorded runs match suite condition {condition['name']!r}, "
+            f"repetition {repetition}"
+        )
+    return matches[0] if matches else None
 
 
 def _compare_conditions(
@@ -510,7 +579,13 @@ def _compare_conditions(
                     )
                     continue
                 output.parent.mkdir(parents=True, exist_ok=True)
-                result = compare_fn([left_entry["run_dir"], right_entry["run_dir"]], output)
+                result = compare_fn(
+                    [
+                        _suite_run_path(left_entry["run_dir"], suite_root),
+                        _suite_run_path(right_entry["run_dir"], suite_root),
+                    ],
+                    output,
+                )
                 comparisons.append(
                     {
                         "left_condition": left["name"],
@@ -723,7 +798,31 @@ def _run_suite_impl(
             name = condition["name"]
             key = _run_key(name, repetition)
             record = manifest["runs"].get(key)
-            run_dir = Path(record["run_dir"]) if record and record.get("run_dir") else None
+            run_dir = (
+                _suite_run_path(record["run_dir"], output)
+                if record and record.get("run_dir")
+                else None
+            )
+            if run_dir is None and resume:
+                run_dir = _discover_unrecorded_run(
+                    output,
+                    condition,
+                    repetition,
+                    previews[name],
+                    execution_controls,
+                )
+                if run_dir is not None:
+                    record = manifest["runs"].setdefault(
+                        key, {"condition": name, "repetition": repetition}
+                    )
+                    record.update(
+                        condition=name,
+                        repetition=repetition,
+                        run_dir=_suite_run_relative(run_dir, output),
+                        run_id=run_dir.name,
+                        status=_load_run_state(run_dir).get("status", "unknown"),
+                    )
+                    _write_suite_state(manifest_path, manifest)
             if run_dir is not None:
                 run_manifest = _load_run_state(run_dir)
                 _verify_run_identity(
@@ -795,10 +894,16 @@ def _run_suite_impl(
             if actual_fingerprint != expected_fingerprint:
                 record = manifest["runs"].setdefault(
                     key,
-                    {"condition": name, "repetition": repetition, "run_dir": str(run_dir)},
+                    {
+                        "condition": name,
+                        "repetition": repetition,
+                        "run_dir": _suite_run_relative(run_dir, output),
+                    },
                 )
                 record.update(
-                    run_dir=str(run_dir), run_id=run_dir.name, status="fingerprint_mismatch"
+                    run_dir=_suite_run_relative(run_dir, output),
+                    run_id=run_dir.name,
+                    status="fingerprint_mismatch",
                 )
                 _write_suite_state(manifest_path, manifest)
                 raise ValueError(
@@ -812,7 +917,7 @@ def _run_suite_impl(
             record.update(
                 condition=name,
                 repetition=repetition,
-                run_dir=str(run_dir),
+                run_dir=_suite_run_relative(run_dir, output),
                 run_id=run_dir.name,
                 status=state_manifest.get("status", "unknown"),
                 benchmark_fingerprint=actual_fingerprint,
@@ -932,7 +1037,7 @@ def _progress(
             condition=condition,
             repetition=repetition,
             status="running",
-            run_dir=str(run_dir),
+            run_dir=_suite_run_relative(run_dir, manifest_path.parent),
             run_id=run_dir.name,
         )
         _write_suite_state(manifest_path, manifest)

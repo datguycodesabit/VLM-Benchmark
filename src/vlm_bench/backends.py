@@ -47,6 +47,40 @@ OPENAI_API_BASE = "https://api.openai.com/v1"
 _PROVIDERS = {"ollama", "trocr", "chatgpt", "openai", "python"}
 
 
+def _token_count(value: Any) -> int | None:
+    """Return an observed non-negative integer token count, never a fallback zero."""
+    if type(value) is int and value >= 0:
+        return value
+    return None
+
+
+def _positive_seconds(value: Any) -> float | None:
+    normalized = _finite_nonnegative(value)
+    return normalized if normalized is not None and normalized > 0 else None
+
+
+def _finite_nonnegative(value: Any) -> float | None:
+    if not isinstance(value, (int, float)) or isinstance(value, bool):
+        return None
+    try:
+        normalized = float(value)
+    except (OverflowError, ValueError):
+        return None
+    return normalized if math.isfinite(normalized) and normalized >= 0 else None
+
+
+def _tokens_per_second(count: Any, duration_seconds: Any) -> float | None:
+    observed_count = _token_count(count)
+    duration = _positive_seconds(duration_seconds)
+    if observed_count is None or duration is None:
+        return None
+    try:
+        rate = observed_count / duration
+    except OverflowError:
+        return None
+    return rate if math.isfinite(rate) else None
+
+
 class BackendPaused(RuntimeError):
     """A provider asked the benchmark to stop this model while saving progress."""
 
@@ -135,17 +169,28 @@ class OllamaBackend(Backend):
         batching=False,
         streaming=False,
         concurrency_safe=False,
-        timing_hooks=("ollama_server_generation", "ollama_model_load"),
-        usage_fields=("prompt_eval_count", "eval_count"),
+        timing_hooks=(
+            "ollama_server_generation",
+            "ollama_model_load",
+            "image_encoding",
+            "time_to_first_output",
+            "response_stream",
+            "tokens_per_second",
+        ),
+        usage_fields=("input_tokens", "output_tokens"),
     )
 
     def __init__(self, base_url: str, timeout: float, settings: dict[str, Any]) -> None:
+        if "streaming" in settings and not isinstance(settings["streaming"], bool):
+            raise ValueError("Ollama streaming setting must be a boolean")
+        self.settings = settings
         client_type = settings.get("client_factory", OllamaClient)
         kwargs: dict[str, Any] = {"base_url": base_url, "timeout": timeout}
         if settings.get("transport") is not None:
             kwargs["transport"] = settings["transport"]
         self.client = client_type(**kwargs)
         self._version: str | None = None
+        self._model_identities: dict[str, dict[str, Any]] = {}
 
     def close(self) -> None:
         self.client.close()
@@ -167,7 +212,7 @@ class OllamaBackend(Backend):
             self._version = self.client.version()
         # Ollama metadata is local model metadata. Retain useful architecture
         # fields, while excluding any incidental non-JSON values.
-        return {
+        identity = {
             "provider": self.provider,
             "model": model,
             "digest": metadata.get("digest"),
@@ -177,15 +222,29 @@ class OllamaBackend(Backend):
             "size": metadata.get("size"),
             "server_version": self._version,
         }
+        self._model_identities[model] = identity
+        return identity
 
     def transcribe(self, model, image_path, prompt, options):
+        streaming = options.get("streaming", self.settings.get("streaming", False))
+        if not isinstance(streaming, bool):
+            raise ValueError("Ollama streaming setting must be a boolean")
         clean_options = {
             key: value
             for key, value in options.items()
-            if key not in {"image_detail", "reasoning_effort", "max_output_tokens"}
+            if key not in {"image_detail", "reasoning_effort", "max_output_tokens", "streaming"}
             and not key.startswith("_vlm_bench_")
         }
-        result = self.client.transcribe(model, image_path, prompt, clean_options)
+        client_timings = None
+        if streaming:
+            transcribe_stream = getattr(self.client, "transcribe_stream", None)
+            if not callable(transcribe_stream):
+                raise RuntimeError(
+                    "Ollama streaming was requested but is unavailable in this client"
+                )
+            result, client_timings = transcribe_stream(model, image_path, prompt, clean_options)
+        else:
+            result = self.client.transcribe(model, image_path, prompt, clean_options)
         if not isinstance(result, dict):
             return result
         timing_fields = {
@@ -196,23 +255,121 @@ class OllamaBackend(Backend):
         }
         timings = []
         for field, metric in timing_fields.items():
-            value = result.get(field)
-            if isinstance(value, (int, float)) and not isinstance(value, bool) and value >= 0:
+            value = _finite_nonnegative(result.get(field))
+            if value is not None:
                 timings.append(
                     timing_observation(
                         metric,
-                        float(value) / 1_000_000_000,
+                        value / 1_000_000_000,
                         unit="seconds",
                         source="provider_reported",
                         start_boundary=f"ollama.{metric}.start",
                         end_boundary=f"ollama.{metric}.complete",
                     )
                 )
+        output_count = _token_count(result.get("eval_count"))
+        input_count = _token_count(result.get("prompt_eval_count"))
+        usage = {}
+        if input_count is not None:
+            usage["input_tokens"] = input_count
+        if output_count is not None:
+            usage["output_tokens"] = output_count
+        if usage:
+            result["usage"] = usage
+
+        eval_duration = _finite_nonnegative(result.get("eval_duration"))
+        generation_duration_seconds = (
+            eval_duration / 1_000_000_000
+            if eval_duration is not None and eval_duration > 0
+            else None
+        )
+        tokens_per_second = _tokens_per_second(output_count, generation_duration_seconds)
+        if tokens_per_second is not None:
+            timings.append(
+                timing_observation(
+                    "tokens_per_second",
+                    tokens_per_second,
+                    unit="tokens/second",
+                    source="provider_reported",
+                    start_boundary="ollama.generation.start",
+                    end_boundary="ollama.generation.complete",
+                )
+            )
+
+        details = result.get("provider_details")
+        if not isinstance(details, dict):
+            details = {}
+        if usage:
+            identity = self._model_identities.get(model, {})
+            details["tokenization"] = {
+                "model_identity": {
+                    "id": model,
+                    "digest": identity.get("digest"),
+                    "server_version": identity.get("server_version", self._version),
+                },
+                "tokenizer_identity": {
+                    "id": None,
+                    "source": "not_exposed_by_ollama",
+                    "model_digest": identity.get("digest"),
+                },
+                "count_source": "ollama.eval_count",
+                "input_count_source": "ollama.prompt_eval_count",
+                "includes_eos": None,
+                "includes_start_token": None,
+                "special_token_policy": "not_exposed_by_ollama",
+            }
+        if isinstance(client_timings, dict):
+            image_encoding = client_timings.get("image_encoding_seconds")
+            ttfo = client_timings.get("time_to_first_output_seconds")
+            response_stream = client_timings.get("response_stream_seconds")
+            timings.extend(
+                [
+                    timing_observation(
+                        "image_encoding",
+                        image_encoding,
+                        unit="seconds",
+                        source=("client_measured" if image_encoding is not None else "unavailable"),
+                        start_boundary=("image_read.start" if image_encoding is not None else None),
+                        end_boundary=(
+                            "ollama_request_payload.ready" if image_encoding is not None else None
+                        ),
+                        unavailable_reason=(
+                            None
+                            if image_encoding is not None
+                            else "Image encoding timing was unavailable"
+                        ),
+                    ),
+                    timing_observation(
+                        "time_to_first_output",
+                        ttfo,
+                        unit="seconds",
+                        source="client_measured" if ttfo is not None else "unavailable",
+                        start_boundary="ollama_stream.start" if ttfo is not None else None,
+                        end_boundary="first_nonempty_text_chunk" if ttfo is not None else None,
+                        unavailable_reason=(
+                            None if ttfo is not None else "The stream returned no text chunk"
+                        ),
+                    ),
+                    timing_observation(
+                        "response_stream",
+                        response_stream,
+                        unit="seconds",
+                        source="client_measured" if response_stream is not None else "unavailable",
+                        start_boundary="ollama_stream.start"
+                        if response_stream is not None
+                        else None,
+                        end_boundary="ollama_done_event" if response_stream is not None else None,
+                        unavailable_reason=(
+                            None
+                            if response_stream is not None
+                            else "No terminal stream timing was available"
+                        ),
+                    ),
+                ]
+            )
         if timings:
-            details = result.get("provider_details")
-            if not isinstance(details, dict):
-                details = {}
             details["timing_observations"] = timings
+        if details:
             result["provider_details"] = details
         return result
 
@@ -230,8 +387,14 @@ class TrOCRBackend(Backend):
         batching=False,
         streaming=False,
         concurrency_safe=False,
-        timing_hooks=("model_load", "image_preprocessing", "inference", "output_conversion"),
-        usage_fields=("eval_count",),
+        timing_hooks=(
+            "model_load",
+            "image_preprocessing",
+            "inference",
+            "output_conversion",
+            "tokens_per_second",
+        ),
+        usage_fields=("output_tokens",),
     )
 
     def __init__(self, timeout: float, settings: dict[str, Any]) -> None:
@@ -426,6 +589,23 @@ class TrOCRBackend(Backend):
             conversion_seconds = time.perf_counter() - conversion_started
             eos_id = getattr(loaded_model.config, "eos_token_id", None)
             ended = bool(eos_id is not None and int(generated[0][-1]) == int(eos_id))
+            observed_token_count = _token_count(token_count)
+            tokenization_timing = _positive_seconds(generation_seconds)
+            tokenizer = getattr(processor, "tokenizer", None)
+            tokenizer_name = getattr(tokenizer, "name_or_path", None)
+            if not isinstance(tokenizer_name, str) or not tokenizer_name.strip():
+                tokenizer_name = None
+            tokenizer_class = (
+                f"{type(tokenizer).__module__}.{type(tokenizer).__qualname__}"
+                if tokenizer is not None
+                else None
+            )
+            model_identity = self._identities[model]
+            usage = (
+                {"output_tokens": observed_token_count}
+                if observed_token_count is not None
+                else None
+            )
             load_duration = self._load_durations.pop(model, None)
             timings = [
                 timing_observation(
@@ -466,6 +646,18 @@ class TrOCRBackend(Backend):
                     end_boundary="decode.complete",
                 ),
             ]
+            tokens_per_second = _tokens_per_second(observed_token_count, tokenization_timing)
+            if tokens_per_second is not None:
+                timings.append(
+                    timing_observation(
+                        "tokens_per_second",
+                        tokens_per_second,
+                        unit="tokens/second",
+                        source="adapter_instrumented",
+                        start_boundary="model.generate.start_after_sync",
+                        end_boundary="model.generate.complete_after_sync",
+                    )
+                )
             return {
                 "model": model,
                 "message": {"role": "assistant", "content": text},
@@ -475,7 +667,8 @@ class TrOCRBackend(Backend):
                 else "length"
                 if token_count >= max_new_tokens
                 else "stop",
-                "eval_count": token_count,
+                "eval_count": observed_token_count,
+                "usage": usage,
                 "load_duration": load_duration or 0,
                 "provider": self.provider,
                 "provider_details": {
@@ -490,6 +683,27 @@ class TrOCRBackend(Backend):
                     "num_beams": num_beams,
                     "processor_use_fast": False,
                     "prompt_supported": False,
+                    "tokenization": {
+                        "model_identity": {
+                            "id": model_identity.get("model"),
+                            "revision": model_identity.get("revision"),
+                            "checkpoint_sha256": model_identity.get("checkpoint_sha256"),
+                        },
+                        "tokenizer_identity": {
+                            "id": tokenizer_name,
+                            "class": tokenizer_class,
+                            "revision": model_identity.get("revision"),
+                        },
+                        "count_source": "transformers.generated_token_ids",
+                        "includes_eos": True if eos_id is not None else None,
+                        "eos_emitted": ended if eos_id is not None else None,
+                        "includes_start_token": False if start_id is not None else None,
+                        "special_token_policy": (
+                            "decoder_start_token_excluded; emitted_eos_included"
+                            if start_id is not None and eos_id is not None
+                            else "partially_unknown"
+                        ),
+                    },
                     "unsupported_options": sorted(
                         key
                         for key in options
@@ -1153,7 +1367,7 @@ class _ResponsesBackend(Backend):
                         event_type = event.get("type")
                         if event_type == "response.output_text.delta":
                             delta = event.get("delta")
-                            if isinstance(delta, str):
+                            if isinstance(delta, str) and delta:
                                 if first_output_at is None:
                                     first_output_at = time.perf_counter()
                                 output_parts.append(delta)

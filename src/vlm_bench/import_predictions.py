@@ -263,6 +263,7 @@ def import_predictions(
     provenance: str | None = None,
     provenance_file: Path | None = None,
     formula_rendering: bool = False,
+    scoring_policy: dict[str, Any] | None = None,
 ) -> Path:
     """Create a schema-v2 run from saved predictions and a prepared snapshot.
 
@@ -285,6 +286,10 @@ def import_predictions(
         raise ValueError(f"System identity does not form a valid external selector: {system!r}")
     if not isinstance(formula_rendering, bool):
         raise ValueError("formula_rendering must be a boolean")
+    if scoring_policy is not None:
+        from .scoring_policy import ScoringPolicy
+
+        scoring_policy = ScoringPolicy.from_dict(scoring_policy).to_dict()
 
     requested_output = Path(output).expanduser()
     if not requested_output.name:
@@ -423,6 +428,10 @@ def import_predictions(
                 else None,
             },
         }
+        if scoring_policy is not None:
+            manifest.update(
+                evaluation_schema_version=2, scoring_policy=scoring_policy, planned_passes=1
+            )
         manifest["integrity"] = _digest(
             {
                 key: value

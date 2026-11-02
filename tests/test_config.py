@@ -96,6 +96,7 @@ def test_prepared_excludes_every_other_selection_setting(tmp_path, selection):
         'version=1\n[models."trocr:test"]\ndevice="tpu"',
         'version=1\n[models."openai:test"]\nimage_detail="medium"',
         'version=1\n[models."openai:test"]\nreasoning_effort="fast"',
+        'version=1\n[models."ollama:test"]\nstreaming="yes"',
         "version=1\n[costs]\nvolumes=[0, 100]",
         "version=1\n[costs]\nvolumes=[100, 100]",
         'version=1\n[costs.local]\nupfront_cost_usd="100"',
@@ -156,6 +157,7 @@ def test_validate_settings_checks_only_selected_models_and_returns_selected_keys
         (["chatgpt:test"], {"chatgpt:test": {"num_beams": 2}}),
         (["ollama:test"], {"ollama:test": {"image_detail": "low"}}),
         (["openai:test"], {"openai:test": {"reasoning_effort": "invalid"}}),
+        (["openai:test"], {"openai:test": {"streaming": True}}),
     ],
 )
 def test_validate_settings_rejects_invalid_or_provider_inapplicable_options(models, settings):
@@ -166,6 +168,12 @@ def test_validate_settings_rejects_invalid_or_provider_inapplicable_options(mode
 def test_validate_settings_allows_chatgpt_num_predict_while_recording_unsupported_control():
     assert validate_settings(["chatgpt:model"], {"chatgpt:model": {"num_predict": 512}}) == {
         "chatgpt:model": {"num_predict": 512}
+    }
+
+
+def test_validate_settings_allows_opt_in_ollama_streaming():
+    assert validate_settings(["ollama:model"], {"ollama:model": {"streaming": True}}) == {
+        "ollama:model": {"streaming": True}
     }
 
 
@@ -268,6 +276,7 @@ def test_config_v3_freezes_weighted_policy_measurement_and_three_pass_default(tm
         "missing_and_failed_as_empty": True,
         "pass_aggregation": "arithmetic_mean",
         "normalization": "whitespace-v1",
+        "equation_normalization": "unicode-nfc-whitespace-v1",
     }
     assert config["measurement"] == {
         "schema_version": 1,
@@ -289,6 +298,10 @@ def test_config_v3_freezes_weighted_policy_measurement_and_three_pass_default(tm
         ),
         ("version=3\n[scoring]\nmissing_and_failed_as_empty=false", "must be true"),
         ('version=3\n[scoring]\nnormalization="unicode-v2"', "normalization"),
+        (
+            'version=3\n[scoring]\nequation_normalization="unicode-v2"',
+            "equation_normalization",
+        ),
         ('version=3\n[measurement]\ncache_policy="allow"', "must be bypass"),
         (
             'version=3\n[measurement]\nprofile="latency"\nconcurrency=2',

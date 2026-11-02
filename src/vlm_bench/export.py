@@ -186,7 +186,10 @@ def _append_table(
                 value = marker
             values.append(value)
         worksheet.append(values)
-        for cell in worksheet[row_number]:
+        # Restrict to this table's columns. Worksheet.max_column scans every
+        # populated cell; doing that for each evidence row becomes quadratic.
+        for column_number in range(1, len(columns) + 1):
+            cell = worksheet.cell(row=row_number, column=column_number)
             # openpyxl treats strings beginning with '=' as formulas. Force all
             # textual values to stored strings, including formula-like content.
             if isinstance(cell.value, str):

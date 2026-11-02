@@ -2,7 +2,13 @@
 
 Notable changes to this project are recorded here.
 
-## Unreleased
+## 0.2.0 — 2026-10-29
+
+- Complete weighted terminal reporting/comparisons, aggregate status, generic suite resume, structured diagnostics, and default weighted CLI imports.
+- Persist experiment plans before inference; recover zero-run and orphaned passes; preserve suite portability and frozen identity.
+- Add opt-in Ollama streaming TTFO, observed token usage/rate provenance, bounded exact polynomial equivalence, and stable raw-evidence/rescore identities.
+- Add portable derived-report rendering, complete diagnostic CSV tables, and an installed-executable HTTP validation workflow.
+- Bound timing summaries and avoid quadratic workbook writes; retain all raw observations in saved run artifacts.
 
 - Add versioned weighted scoring, failure/missing penalties, separate prose/equation leaderboards, anchored accuracy bands, and conservative equation equivalence diagnostics.
 - Add configuration version 3, three-pass defaults, an editable configuration wizard, shared offline HTML/Excel/CSV/JSON reports, and explicit measurement profiles.

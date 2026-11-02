@@ -639,7 +639,10 @@ def test_separate_runs_compare_and_cli_token_limit_overrides_config(tmp_path, mo
     )
     second = next(d for d in runs.iterdir() if d != first)
     output = tmp_path / "comparison"
-    assert main(["compare", "--runs", str(first), str(second), "--output", str(output)]) == 0
+    assert (
+        main(["compare", "--runs", str(first), str(second), "--output", str(output), "--weighted"])
+        == 0
+    )
     report = json.loads((output / "comparison.json").read_text())
     assert len(report["tracks"]["prose"]["model_results"]) == 2
     assert all(r["cer"] == 0 for r in report["tracks"]["prose"]["model_results"])

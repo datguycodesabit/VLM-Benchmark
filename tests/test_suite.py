@@ -88,7 +88,13 @@ def _write_fake_run(
     output_dir.mkdir(parents=True, exist_ok=True)
     run_dir = output_dir / f"{condition['name']}-{repetition}"
     run_dir.mkdir()
+    crop_dir = run_dir / "crops"
+    crop_dir.mkdir()
     samples = _samples()
+    for index, sample in enumerate(samples, start=1):
+        crop = crop_dir / f"{sample['id']}.png"
+        crop.write_bytes(f"crop{index}".encode())
+        sample["crop_path"] = str(crop)
     actual_fingerprint = fingerprint(samples, "original")
     manifest = {
         "schema_version": 2,
@@ -222,6 +228,91 @@ def test_repetitions_persist_run_paths_and_preserve_independent_counts(tmp_path,
     assert len({value["run_id"] for value in variability["per_repetition"]}) == 2
 
 
+def test_resume_adopts_run_committed_before_suite_path_write(tmp_path, monkeypatch):
+    path, normalized = _config(tmp_path)
+    _install_config(monkeypatch, normalized)
+    output = tmp_path / "suite-out"
+    condition = normalized["suite"]["conditions"][0]
+
+    def interrupted_run(_data, _models, run_output, **kwargs):
+        _write_fake_run(
+            tmp_path,
+            condition,
+            kwargs["repetition"],
+            run_output,
+            lambda _message: None,
+        )
+        raise KeyboardInterrupt
+
+    with pytest.raises(KeyboardInterrupt):
+        suite.run_suite(
+            path,
+            output,
+            preview_fn=lambda *_args, **_kwargs: _preview(),
+            run_fn=interrupted_run,
+            progress=lambda _message: None,
+            compare_fn=lambda *_args, **_kwargs: {},
+        )
+
+    result = suite.run_suite(
+        path,
+        output,
+        resume=True,
+        preview_fn=lambda *_args, **_kwargs: _preview(),
+        run_fn=lambda *_args, **_kwargs: pytest.fail("orphaned committed run should be adopted"),
+        resume_fn=lambda *_args, **_kwargs: pytest.fail("completed orphan should be reused"),
+        progress=lambda _message: None,
+        compare_fn=lambda *_args, **_kwargs: {},
+    )
+
+    manifest = json.loads((output / "suite.json").read_text(encoding="utf-8"))
+    entry = manifest["runs"][suite._run_key("baseline", 1)]
+    assert result["conditions"]["baseline"]["status"] == "complete"
+    assert entry["status"] == "complete"
+    assert suite._suite_run_path(entry["run_dir"], output).is_dir()
+
+
+def test_suite_resume_rebases_moved_run_and_crop_paths(tmp_path, monkeypatch):
+    import shutil
+
+    path, normalized = _config(tmp_path)
+    _install_config(monkeypatch, normalized)
+    output = tmp_path / "suite-out"
+    condition = normalized["suite"]["conditions"][0]
+    run_calls = []
+
+    def run_fn(_data, _models, run_output, **kwargs):
+        run_calls.append(kwargs["repetition"])
+        return _write_fake_run(
+            tmp_path,
+            condition,
+            kwargs["repetition"],
+            run_output,
+            kwargs["progress"],
+        )[0]
+
+    kwargs = {
+        "preview_fn": lambda *_args, **_kwargs: _preview(),
+        "run_fn": run_fn,
+        "progress": lambda _message: None,
+        "compare_fn": lambda *_args, **_kwargs: {},
+    }
+    suite.run_suite(path, output, **kwargs)
+    moved = tmp_path / "moved-suite"
+    shutil.move(output, moved)
+
+    result = suite.run_suite(path, moved, resume=True, **kwargs)
+
+    manifest = json.loads((moved / "suite.json").read_text(encoding="utf-8"))
+    entry = manifest["runs"][suite._run_key("baseline", 1)]
+    run_dir = suite._suite_run_path(entry["run_dir"], moved)
+    run_manifest = json.loads((run_dir / "manifest.json").read_text())
+    assert result["conditions"]["baseline"]["status"] == "complete"
+    assert run_calls == [1]
+    assert run_dir.is_dir()
+    assert all(Path(sample["crop_path"]).is_file() for sample in run_manifest["samples"])
+
+
 def test_resume_rejects_changed_config_before_preview(tmp_path, monkeypatch):
     path, normalized = _config(tmp_path)
     _install_config(monkeypatch, normalized)
@@ -317,6 +408,51 @@ def test_resume_skips_completed_runs_and_reuses_comparison_artifacts(tmp_path, m
     assert len(run_calls) == 2 and len(compare_calls) == 1
     suite.run_suite(path, output, resume=True, **kwargs)
     assert len(run_calls) == 2 and len(compare_calls) == 1
+
+
+def test_suite_resume_rejects_model_identity_changed_since_saved_pass(tmp_path):
+    condition = {
+        "name": "baseline",
+        "models": ["ollama:fake"],
+        "settings": {},
+        "repeats": 1,
+        "strict_research": False,
+        "protocol": "document-disjoint",
+        "formula_rendering": False,
+        "warmup": False,
+    }
+    _run_dir, run_manifest = _write_fake_run(
+        tmp_path,
+        condition,
+        1,
+        tmp_path / "runs",
+        lambda _message: None,
+    )
+    preview = _preview()
+    preview["models"] = [
+        {
+            "selector": "ollama:fake",
+            "model_info": {"revision": "changed"},
+        }
+    ]
+
+    with pytest.raises(ValueError, match="model identity changed"):
+        suite._verify_run_identity(
+            run_manifest,
+            condition,
+            1,
+            preview,
+            {
+                "base_url": "http://localhost:11434",
+                "timeout": 300,
+                "num_predict": 4096,
+                "max_retries": 2,
+                "concurrency": 1,
+                "max_requests": None,
+                "max_spend_usd": None,
+                "cache_dir": None,
+            },
+        )
 
 
 def test_resume_rejects_missing_saved_run_directory(tmp_path, monkeypatch):
@@ -460,7 +596,9 @@ def test_run_manifest_integrity_is_checked_before_reuse(tmp_path, monkeypatch):
         compare_fn=lambda *_args, **_kwargs: {},
     )
     manifest = json.loads((output / "suite.json").read_text(encoding="utf-8"))
-    run_dir = Path(manifest["runs"][suite._run_key("baseline", 1)]["run_dir"])
+    run_dir = suite._suite_run_path(
+        manifest["runs"][suite._run_key("baseline", 1)]["run_dir"], output
+    )
     run_manifest_path = run_dir / "manifest.json"
     run_manifest = json.loads(run_manifest_path.read_text(encoding="utf-8"))
     run_manifest["models"] = ["ollama:tampered"]

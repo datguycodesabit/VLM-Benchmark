@@ -68,3 +68,10 @@ timing evidence, conservative equivalence, init wizard, and shared offline repor
 are implemented. See [UPDATE_REPORT.md](UPDATE_REPORT.md) for all updates,
 423-test verification, the synthetic 1,000-image workflow, package checks, and
 explicit live-provider/hardware limits. See [CLI_GUIDE.md](CLI_GUIDE.md) for usage.
+
+## 2026-10-29 completion
+
+Version 0.2.0 closes the remaining command, recovery, comparison and measurement
+gaps. See [COMPLETION_REPORT.md](COMPLETION_REPORT.md) for all changes, 460 passing
+tests, and the installed CLI's 1,000-image HTTP pause/resume/report validation.
+The earlier counts and limitations above are historical.

@@ -6,6 +6,8 @@ import math
 from collections.abc import Mapping, Sequence
 from typing import Any
 
+RANKING_VERSION = 1
+
 
 def _finite_nonnegative(value: Any) -> float | None:
     if isinstance(value, bool) or value is None:
@@ -170,6 +172,10 @@ def rank_track(
         status = "unavailable"
 
     return {
+        "version": RANKING_VERSION,
+        "band_rule": "anchored_at_highest_remaining_score",
+        "within_band_rule": "median_latency_then_score_then_model",
+        "latency_basis": "successful_uncached_requests",
         "status": status,
         "accuracy_margin_points": margin,
         "winner": winner,

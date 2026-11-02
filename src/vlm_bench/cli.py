@@ -11,6 +11,7 @@ import re
 import sys
 from pathlib import Path
 
+from . import __version__
 from .export import export_run
 from .metrics import score, summarize
 from .runner import _digest, _lock, read_records, resume_benchmark
@@ -21,6 +22,7 @@ def parser():
         prog="vlm-bench",
         description="Benchmark handwriting recognition across local and cloud models.",
     )
+    root.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
     root.add_argument(
         "--json",
         action="store_true",
@@ -106,6 +108,9 @@ def parser():
     imported.add_argument("--predictions", type=Path, required=True)
     imported.add_argument("--output", type=Path, required=True)
     imported.add_argument("--system", required=True, help="External OCR/VLM system identity")
+    imported.add_argument(
+        "--scoring-config", type=Path, help="Use weights from a version 3 scoring configuration"
+    )
     provenance = imported.add_mutually_exclusive_group(required=True)
     provenance.add_argument("--provenance", help="Short description of the external run")
     provenance.add_argument("--provenance-file", type=Path, help="JSON provenance sidecar")
@@ -119,6 +124,9 @@ def parser():
         "resume", help="Continue unrecorded samples with unchanged data and models"
     )
     resume.add_argument("--run", type=Path, required=True)
+    resume.add_argument(
+        "--config", type=Path, help="Suite configuration (when its saved path has moved)"
+    )
     resume.add_argument("--retry-failed", action="store_true")
     resume.add_argument("--max-requests", type=_positive_int_argument, default=None)
     resume.add_argument("--max-spend-usd", type=_positive_float_argument, default=None)
@@ -128,7 +136,9 @@ def parser():
     inspect.add_argument(
         "--output", type=Path, help="HTML output path (default: RUN/inspection.html)"
     )
-    report = sub.add_parser("report", help="Summarize saved results by sample metadata")
+    report = sub.add_parser(
+        "report", help="Generate offline weighted reports or subgroup summaries"
+    )
     report.add_argument("--run", type=Path, required=True)
     report.add_argument(
         "--group-by",
@@ -140,6 +150,11 @@ def parser():
         "--weighted",
         action="store_true",
         help="Explicitly derive a default weighted evaluation for legacy evidence",
+    )
+    report.add_argument(
+        "--scoring-config",
+        type=Path,
+        help="Explicit offline re-evaluation using a version 3 scoring configuration",
     )
     report.add_argument(
         "--formats",
@@ -159,8 +174,9 @@ def parser():
         )
     doctor = sub.add_parser("doctor", help="Check dependencies, credentials and engines")
     doctor.add_argument(
-        "--provider", choices=["ollama", "trocr", "chatgpt", "openai"], default="ollama"
+        "--provider", choices=["ollama", "trocr", "python", "chatgpt", "openai"], default="ollama"
     )
+    doctor.add_argument("--device", choices=["auto", "cpu", "mps", "cuda", "rocm"], default="auto")
     doctor.add_argument("--base-url", default="http://localhost:11434")
     doctor.add_argument("--models", nargs="*", default=[])
     dataset = sub.add_parser(
@@ -202,6 +218,16 @@ def parser():
     compare = sub.add_parser("compare", help="Compare separate runs on the same frozen benchmark")
     compare.add_argument("--runs", type=Path, nargs="+", required=True)
     compare.add_argument("--output", type=Path, required=True)
+    compare.add_argument(
+        "--weighted",
+        action="store_true",
+        help="Explicitly evaluate legacy sources with the default weighted policy",
+    )
+    compare.add_argument(
+        "--scoring-config",
+        type=Path,
+        help="Explicit offline re-evaluation using a version 3 scoring configuration",
+    )
     return root
 
 
@@ -242,6 +268,60 @@ def _positive_float_argument(value):
     if result <= 0 or not math.isfinite(result):
         raise argparse.ArgumentTypeError("must be a positive finite number")
     return result
+
+
+def _offline_policy(config_path, *, default=False):
+    from .scoring_policy import ScoringPolicy
+
+    if config_path:
+        from .config import load_config
+
+        config = load_config(config_path)
+        if config["version"] != 3:
+            raise ValueError("Offline scoring configuration requires version = 3")
+        return ScoringPolicy.from_dict(config["scoring"]).to_dict()
+    return ScoringPolicy().to_dict() if default else None
+
+
+def _print_weighted(source, *, policy=None):
+    from .reporting import load_report_model
+
+    _print_weighted_model(load_report_model(source, policy=policy))
+
+
+def _print_weighted_model(report):
+    for condition, evaluation in report.get("conditions", {}).items():
+        if not evaluation.get("tracks"):
+            print(
+                f"{condition}: {evaluation.get('reason', evaluation.get('status', 'unavailable'))}"
+            )
+            continue
+        for track, data in evaluation["tracks"].items():
+            if not data.get("eligible_sample_count"):
+                continue
+            ranking = data["ranking"]
+            winner = ranking.get("winner") or f"withheld ({ranking.get('winner_reason')})"
+            print(f"{condition} / {track}: winner {winner}")
+            print(f"{'Rank':>4} {'Model':<44} {'Score':>9} {'SD':>8} {'p50 sec':>10} Coverage")
+            rows = sorted(
+                data.get("models", []),
+                key=lambda row: (
+                    row.get("rank") is None,
+                    row.get("rank") or 0,
+                    -(row.get("score") or 0),
+                    row["model"],
+                ),
+            )
+            for row in rows:
+
+                def number(key):
+                    return "N/A" if row.get(key) is None else f"{row[key]:.5g}"
+
+                print(
+                    f"{row.get('rank') or '—':>4} {row['model']:<44} {number('score'):>9} "
+                    f"{number('score_stddev'):>8} {number('median_latency_seconds'):>10} "
+                    f"{number('sample_coverage')}"
+                )
 
 
 def _report(run_dir):
@@ -306,6 +386,7 @@ def _report(run_dir):
 
             for output in write_report(run_dir):
                 print(f"Saved: {output}")
+            _print_weighted(run_dir)
         return
     print(f"{'Model':<28} {'CER':>9} {'WER':>9} {'Exact':>9} {'p50 sec':>9}  Status")
     for summary in summarize(
@@ -513,6 +594,11 @@ def _json_cli(arguments):
         run_paths = list(dict.fromkeys(run_paths))
     if run_paths:
         payload["run_directory"] = run_paths[-1] if len(run_paths) == 1 else run_paths
+    experiment_paths = [
+        line.removeprefix("Experiment: ") for line in messages if line.startswith("Experiment: ")
+    ]
+    if experiment_paths:
+        payload["experiment_directory"] = experiment_paths[-1]
     if args.command == "suite":
         payload["suite_directory"] = str(args.output.resolve())
         suite_report = args.output / "suite-report.json"
@@ -528,11 +614,22 @@ def _json_cli(arguments):
         payload["comparison_directory"] = str(args.output.resolve())
         comparison_files = [
             args.output / name
-            for name in ("comparison.json", "comparison.csv", "paired.csv", "costs.csv")
+            for name in (
+                "comparison.json",
+                "comparison.csv",
+                "paired.csv",
+                "costs.csv",
+                "report.html",
+                "report.xlsx",
+                "evaluation.json",
+                "leaderboards.csv",
+            )
             if (args.output / name).is_file()
         ]
         if comparison_files:
             payload["report_paths"] = [str(path.resolve()) for path in comparison_files]
+            if exit_code == 0:
+                payload["result"] = json.loads((args.output / "comparison.json").read_text())
     elif args.command == "inspect":
         inspection_path = args.output or args.run / "inspection.html"
         if inspection_path.is_file():
@@ -560,6 +657,12 @@ def _json_cli(arguments):
         payload["run_directory"] = str(args.run.resolve())
     elif args.command == "report":
         payload["run_directory"] = str(args.run.resolve())
+        if not args.group_by and exit_code == 0:
+            from .reporting import load_report_model
+
+            payload["result"] = load_report_model(
+                args.run, policy=_offline_policy(args.scoring_config, default=args.weighted)
+            )
     elif args.command == "status":
         payload["run_directory"] = str(args.run.resolve())
     elif args.command == "dataset" and args.dataset_command == "split":
@@ -613,7 +716,14 @@ def main(argv=None):
                 args.output, prepared=prepared, models=models, repeats=args.repeats
             )
             print(f"Saved: {output}")
-            print(f"Run: vlm-bench suite --config {output} --output runs/benchmark")
+            import shlex
+
+            print(
+                "Run: "
+                + shlex.join(
+                    ["vlm-bench", "suite", "--config", str(output), "--output", "runs/benchmark"]
+                )
+            )
         elif args.command == "prepare":
             output = args.output or args.data / "prepared"
             from .snapshot import freeze
@@ -674,35 +784,16 @@ def main(argv=None):
             from .backends import create_backend
 
             if args.command == "doctor":
-                import importlib.util
-                import os
+                from .diagnostics import diagnose
 
-                dependencies = {
-                    n: importlib.util.find_spec(n) is not None
-                    for n in ("torch", "transformers", "keyring", "jwt")
-                }
-                print(
-                    json.dumps(
-                        {
-                            "provider": args.provider,
-                            "dependencies": dependencies,
-                            "openai_key_configured": bool(os.environ.get("OPENAI_API_KEY")),
-                        },
-                        indent=2,
-                    )
+                result = diagnose(
+                    args.provider, models=args.models, base_url=args.base_url, device=args.device
                 )
+                print(json.dumps(result, indent=2, ensure_ascii=False, allow_nan=False))
+                return 0 if result["ready"] else 1
             with create_backend(
                 args.provider, base_url=args.base_url, timeout=getattr(args, "timeout", 10)
             ) as client:
-                if args.command == "doctor" and args.models:
-                    from .backends import parse_model
-
-                    for name in args.models:
-                        provider, resolved = parse_model(name)
-                        if name.startswith(args.provider + ":"):
-                            name = resolved
-                        print(json.dumps(client.validate_model(name), indent=2))
-                    return 0
                 for model in client.list_models():
                     name = model.get("name", model.get("model", model.get("id", "")))
                     try:
@@ -724,8 +815,29 @@ def main(argv=None):
             if config.get("suite"):
                 from .suite import run_suite
 
+                supplied = list(argv) if argv is not None else sys.argv[1:]
                 if args.models or args.repeats is not None:
                     raise ValueError("Set models and repeats in the suite configuration")
+                unsupported = {
+                    "--data",
+                    "--prepared",
+                    "--limit",
+                    "--seed",
+                    "--layout",
+                    "--split",
+                    "--content-type",
+                    "--preprocess",
+                    "--strict-research",
+                    "--no-strict-research",
+                    "--protocol",
+                    "--formula-rendering",
+                    "--no-formula-rendering",
+                    "--no-warmup",
+                }
+                if any(value.split("=", 1)[0] in unsupported for value in supplied):
+                    raise ValueError(
+                        "Set dataset, research and warmup options in the suite configuration"
+                    )
                 result = run_suite(
                     args.config,
                     args.output,
@@ -735,6 +847,9 @@ def main(argv=None):
                     max_requests=args.max_requests,
                     max_spend_usd=args.max_spend_usd,
                     cache_dir=args.cache_dir,
+                    base_url=args.base_url,
+                    timeout=args.timeout,
+                    num_predict=args.num_predict,
                 )
                 print(json.dumps(result, ensure_ascii=False, indent=2, allow_nan=False))
                 if not args.dry_run:
@@ -901,6 +1016,8 @@ def main(argv=None):
                         frozen_options["frozen_validation_scope"] = (
                             "source-dataset-and-selected-test-samples"
                         )
+                        if frozen_options.get("split") is None:
+                            frozen_options["split"] = "test"
 
                     snapshot_dir = experiment_dir / "prepared"
                     selection_keys = (
@@ -924,6 +1041,26 @@ def main(argv=None):
                         frozen_options.pop(key, None)
                     frozen_options["prepared"] = snapshot_dir
                     pass_data = None
+                if repeats > 1:
+                    from .experiments import initialize_experiment_plan
+
+                    frozen_options["prepared"] = initialize_experiment_plan(
+                        experiment_dir,
+                        planned_passes=repeats,
+                        prepared=frozen_options["prepared"],
+                        models=selected,
+                        run_kwargs={
+                            **{
+                                key: value
+                                for key, value in frozen_options.items()
+                                if key != "prepared"
+                            },
+                            "warmup": not args.no_warmup and experiment.get("warmup", True),
+                            "costs": config["costs"],
+                        },
+                    )
+                    state = json.loads((experiment_dir / "experiment.json").read_text())
+                    print(f"Experiment: {experiment_dir.resolve()}")
                 for repetition in range(1, repeats + 1):
                     pass_options = dict(frozen_options)
                     if repeats > 1:
@@ -973,6 +1110,7 @@ def main(argv=None):
 
                     for output in write_report(experiment_dir):
                         print(f"Saved: {output}")
+                    _print_weighted(experiment_dir)
             return 2 if failed else 0
         elif args.command == "suite":
             from .suite import run_suite
@@ -994,6 +1132,7 @@ def main(argv=None):
 
                 for output in write_report(args.output):
                     print(f"Saved: {output}")
+                _print_weighted(args.output)
                 failed = any(
                     condition["status"] != "complete" for condition in report["conditions"].values()
                 )
@@ -1010,6 +1149,7 @@ def main(argv=None):
                 provenance=args.provenance,
                 provenance_file=args.provenance_file,
                 formula_rendering=args.formula_rendering,
+                scoring_policy=_offline_policy(args.scoring_config, default=True),
             )
             print(f"Imported run: {run_dir}")
             _report(run_dir)
@@ -1040,23 +1180,48 @@ def main(argv=None):
             print(f"Saved inspection report: {output}")
         elif args.command == "report":
             if args.group_by:
+                if args.weighted or args.scoring_config or args.output:
+                    raise ValueError(
+                        "--group-by cannot be combined with weighted policy or report output options"
+                    )
                 from .inspection import group_report
 
                 report = group_report(args.run, args.group_by)
                 print(json.dumps(report, ensure_ascii=False, indent=2, allow_nan=False))
             else:
                 from .reporting import write_report
-                from .scoring_policy import ScoringPolicy
 
                 for output in write_report(
                     args.run,
                     args.output,
                     formats=args.formats,
-                    policy=ScoringPolicy() if args.weighted else None,
+                    policy=_offline_policy(args.scoring_config, default=args.weighted),
                 ):
                     print(f"Saved: {output}")
+                _print_weighted(
+                    args.run, policy=_offline_policy(args.scoring_config, default=args.weighted)
+                )
         elif args.command == "compare":
             from .comparison import compare
+            from .weighted_comparison import compare_weighted, needs_weighted_comparison
+
+            if args.weighted or args.scoring_config or needs_weighted_comparison(args.runs):
+                report = compare_weighted(
+                    args.runs,
+                    args.output,
+                    policy=_offline_policy(args.scoring_config, default=args.weighted),
+                )
+                _print_weighted_model(report)
+                for name in (
+                    "comparison.json",
+                    "comparison.csv",
+                    "report.html",
+                    "report.xlsx",
+                    "evaluation.json",
+                    "leaderboards.csv",
+                ):
+                    print(f"Saved: {args.output / name}")
+                return 0
 
             report = compare(args.runs, args.output)
             for track, result in report["tracks"].items():
@@ -1081,6 +1246,37 @@ def main(argv=None):
                     )
             print(f"Saved comparison: {args.output.resolve()}")
         elif args.command == "resume":
+            if (args.run / "suite.json").is_file():
+                from .reporting import write_report
+                from .suite import _read_manifest, run_suite
+
+                if args.retry_failed:
+                    raise ValueError(
+                        "Retry failed predictions by resuming their individual pass with --retry-failed"
+                    )
+                saved = _read_manifest(args.run / "suite.json")
+                config_path = args.config or Path(saved.get("config_path") or "")
+                if not config_path.is_file():
+                    raise ValueError(
+                        "Saved suite configuration is unavailable; provide resume --config PATH"
+                    )
+                result = run_suite(
+                    config_path,
+                    args.run,
+                    resume=True,
+                    max_requests=args.max_requests,
+                    max_spend_usd=args.max_spend_usd,
+                )
+                for output in write_report(args.run):
+                    print(f"Saved: {output}")
+                _print_weighted(args.run)
+                return (
+                    0
+                    if all(item["status"] == "complete" for item in result["conditions"].values())
+                    else 2
+                )
+            if args.config:
+                raise ValueError("resume --config applies only to suite directories")
             if (args.run / "experiment.json").is_file():
                 from .experiments import resume_experiment
                 from .reporting import write_report
@@ -1093,6 +1289,7 @@ def main(argv=None):
                 )
                 for output in write_report(directory):
                     print(f"Saved: {output}")
+                _print_weighted(directory)
                 state = json.loads((directory / "experiment.json").read_text())
                 manifests = [
                     json.loads((directory / path / "manifest.json").read_text())
@@ -1101,10 +1298,7 @@ def main(argv=None):
                 return (
                     0
                     if len(manifests) == state["planned_passes"]
-                    and all(
-                        manifest.get("status") in {"complete", "complete_with_errors"}
-                        for manifest in manifests
-                    )
+                    and all(manifest.get("status") == "complete" for manifest in manifests)
                     else 2
                 )
             manifest = json.loads((args.run / "manifest.json").read_text())
@@ -1259,7 +1453,7 @@ def main(argv=None):
             file=sys.stderr,
         )
         return 130
-    except (ValueError, RuntimeError, OSError, KeyError) as exc:
+    except (ValueError, RuntimeError, OSError, KeyError, TypeError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
     return 0

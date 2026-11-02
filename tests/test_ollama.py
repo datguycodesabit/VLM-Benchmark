@@ -80,6 +80,83 @@ def test_transcribe_posts_single_image_and_returns_raw_response(tmp_path: Path) 
     assert "think" not in captured
 
 
+def test_streaming_transcribe_buffers_text_and_reports_client_timings(tmp_path: Path) -> None:
+    image_path = tmp_path / "sample.png"
+    image_path.write_bytes(b"handwritten image bytes")
+    captured: dict = {}
+    chunks = [
+        {
+            "model": "llava:7b",
+            "message": {"role": "assistant", "content": "The handwritten "},
+            "done": False,
+        },
+        {
+            "model": "llava:7b",
+            "message": {"role": "assistant", "content": "text."},
+            "done": False,
+        },
+        {
+            "model": "llava:7b",
+            "message": {"role": "assistant", "content": ""},
+            "done": True,
+            "total_duration": 500,
+            "prompt_eval_count": 4,
+            "eval_count": 3,
+        },
+    ]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        captured.update(json.loads(request.content))
+        body = "".join(json.dumps(chunk) + "\n" for chunk in chunks)
+        return httpx.Response(
+            200,
+            headers={"content-type": "application/x-ndjson"},
+            text=body,
+            request=request,
+        )
+
+    with OllamaClient(transport=httpx.MockTransport(handler)) as client:
+        result, timings = client.transcribe_stream(
+            "llava:7b", image_path, "Transcribe exactly.", {"temperature": 0}
+        )
+
+    assert captured["stream"] is True
+    assert result["message"]["content"] == "The handwritten text."
+    assert result["done"] is True
+    assert result["total_duration"] == 500
+    assert timings["image_encoding_seconds"] >= 0
+    assert timings["time_to_first_output_seconds"] is not None
+    assert timings["response_stream_seconds"] is not None
+
+
+def test_streaming_transcribe_discards_partial_output_without_terminal_event(
+    tmp_path: Path,
+) -> None:
+    image_path = tmp_path / "sample.png"
+    image_path.write_bytes(b"handwritten image bytes")
+    body = (
+        json.dumps(
+            {
+                "message": {"role": "assistant", "content": "partial text"},
+                "done": False,
+            }
+        )
+        + "\n"
+    )
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"content-type": "application/x-ndjson"},
+            text=body,
+            request=request,
+        )
+
+    with OllamaClient(transport=httpx.MockTransport(handler)) as client:
+        with pytest.raises(RuntimeError, match="without a terminal done event"):
+            client.transcribe_stream("llava:7b", image_path, "Transcribe exactly.", {})
+
+
 def test_transcribe_disables_thinking_only_when_model_metadata_allows_it(
     tmp_path: Path,
 ) -> None:

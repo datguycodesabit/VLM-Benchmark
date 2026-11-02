@@ -116,6 +116,118 @@ def test_ollama_adapter_keeps_legacy_response_and_sanitizes_identity():
     backend.close()
 
 
+def test_ollama_streaming_option_adds_client_timing_without_changing_response_shape():
+    observed = {}
+
+    class StreamingOllama:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        def close(self):
+            pass
+
+        def validate_model(self, model):
+            return {"digest": "sha256:streamed-model"}
+
+        def version(self):
+            return "0.12.0"
+
+        def transcribe_stream(self, model, image_path, prompt, options):
+            observed["stream_options"] = options
+            return (
+                {
+                    "model": model,
+                    "message": {"role": "assistant", "content": "recognized"},
+                    "done": True,
+                    "total_duration": 1_000_000_000,
+                    "prompt_eval_count": 11,
+                    "eval_count": 4,
+                    "eval_duration": 2_000_000_000,
+                },
+                {
+                    "image_encoding_seconds": 0.001,
+                    "time_to_first_output_seconds": 0.02,
+                    "response_stream_seconds": 0.03,
+                },
+            )
+
+    backend = create_backend(
+        "ollama",
+        settings={"client_factory": StreamingOllama, "streaming": True},
+    )
+    backend.validate_model("vision:latest")
+    result = backend.transcribe(
+        "vision:latest",
+        Path("image.png"),
+        "Read the image",
+        {"num_predict": 64, "streaming": True},
+    )
+
+    assert observed["stream_options"] == {"num_predict": 64}
+    assert backend.capabilities.streaming is False
+    observations = result["provider_details"]["timing_observations"]
+    by_name = {item["metric_name"]: item for item in observations}
+    assert by_name["time_to_first_output"]["value"] == pytest.approx(0.02)
+    assert by_name["time_to_first_output"]["source"] == "client_measured"
+    assert by_name["time_to_first_output"]["end_boundary"] == "first_nonempty_text_chunk"
+    assert by_name["request_total"]["source"] == "provider_reported"
+    assert result["usage"] == {"input_tokens": 11, "output_tokens": 4}
+    assert "total_tokens" not in result["usage"]
+    assert result["provider_details"]["tokenization"]["model_identity"] == {
+        "id": "vision:latest",
+        "digest": "sha256:streamed-model",
+        "server_version": "0.12.0",
+    }
+    assert result["provider_details"]["tokenization"]["tokenizer_identity"]["source"] == (
+        "not_exposed_by_ollama"
+    )
+    assert result["provider_details"]["tokenization"]["includes_eos"] is None
+    assert by_name["tokens_per_second"]["value"] == pytest.approx(2.0)
+    assert by_name["tokens_per_second"]["source"] == "provider_reported"
+    assert by_name["tokens_per_second"]["start_boundary"] == "ollama.generation.start"
+    backend.close()
+
+
+@pytest.mark.parametrize(
+    ("reported_count", "duration_ns", "expected_usage", "expected_rate"),
+    [
+        (None, 2_000_000_000, None, False),
+        (True, 2_000_000_000, None, False),
+        (-1, 2_000_000_000, None, False),
+        (4, 0, {"output_tokens": 4}, False),
+        (0, 2_000_000_000, {"output_tokens": 0}, True),
+    ],
+)
+def test_ollama_does_not_fabricate_usage_or_rate(
+    reported_count, duration_ns, expected_usage, expected_rate
+):
+    class IncompleteOllama:
+        def __init__(self, **kwargs):
+            pass
+
+        def close(self):
+            pass
+
+        def transcribe(self, *args):
+            return {
+                "message": {"content": "recognized"},
+                "done": True,
+                "eval_count": reported_count,
+                "eval_duration": duration_ns,
+            }
+
+    with create_backend("ollama", settings={"client_factory": IncompleteOllama}) as backend:
+        result = backend.transcribe("vision", Path("image.png"), "read", {})
+
+    assert result.get("usage") == expected_usage
+    timing_names = {
+        item["metric_name"]
+        for item in result.get("provider_details", {}).get("timing_observations", [])
+    }
+    assert ("tokens_per_second" in timing_names) is expected_rate
+    assert ("tokenization" in result.get("provider_details", {})) is (expected_usage is not None)
+
+
 def test_openai_streams_response_and_keeps_credentials_out_of_result(tmp_path: Path):
     image = tmp_path / "line.png"
     image.write_bytes(b"small png")
@@ -167,6 +279,37 @@ def test_openai_streams_response_and_keeps_credentials_out_of_result(tmp_path: P
     assert payload["store"] is False and payload["stream"] is True
     assert payload["max_output_tokens"] == 48
     assert payload["input"][0]["content"][1]["image_url"].startswith("data:image/png;base64,")
+
+
+def test_openai_ttfo_uses_first_nonempty_text_delta_and_is_not_prefill(tmp_path, monkeypatch):
+    image = tmp_path / "line.png"
+    image.write_bytes(b"image")
+
+    def handler(request):
+        return httpx.Response(
+            200,
+            headers={"content-type": "text/event-stream"},
+            text=_sse(
+                {"type": "response.output_text.delta", "delta": ""},
+                {"type": "response.output_text.delta", "delta": "written"},
+                _completed(text="written"),
+            ),
+        )
+
+    with create_backend(
+        "openai",
+        settings={"api_key": "temporary", "transport": httpx.MockTransport(handler)},
+    ) as backend:
+        result = backend.transcribe("model", image, "read", {})
+
+    observations = {
+        item["metric_name"]: item for item in result["provider_details"]["timing_observations"]
+    }
+    assert observations["time_to_first_output"]["value"] is not None
+    assert observations["time_to_first_output"]["end_boundary"] == "first_text_delta"
+    assert "prefill" not in observations["time_to_first_output"]["metric_name"]
+    assert observations["prefill_duration"]["value"] is None
+    assert "tokens_per_second" not in observations
 
 
 def test_chatgpt_omits_unsupported_max_output_tokens_and_reports_it(tmp_path, monkeypatch):
@@ -437,6 +580,9 @@ def test_trocr_uses_local_checkpoint_hash_and_reports_load_duration(tmp_path, mo
             return nullcontext()
 
     class FakeProcessor:
+        def __init__(self):
+            self.tokenizer = SimpleNamespace(name_or_path="trocr-tokenizer")
+
         @classmethod
         def from_pretrained(cls, location, revision=None, use_fast=None):
             captured["processor"] = (location, revision)
@@ -489,6 +635,23 @@ def test_trocr_uses_local_checkpoint_hash_and_reports_load_duration(tmp_path, mo
     assert result["message"]["content"] == "written words"
     assert result["provider_details"]["revision"] == "resolved-commit"
     assert result["load_duration"] > 0
+    assert result["usage"] == {"output_tokens": 2}
+    tokenization = result["provider_details"]["tokenization"]
+    assert tokenization["model_identity"]["checkpoint_sha256"] == identity["checkpoint_sha256"]
+    assert tokenization["model_identity"]["revision"] == "resolved-commit"
+    assert tokenization["tokenizer_identity"]["id"] == "trocr-tokenizer"
+    assert tokenization["count_source"] == "transformers.generated_token_ids"
+    assert tokenization["includes_start_token"] is False
+    assert tokenization["includes_eos"] is True
+    assert tokenization["eos_emitted"] is True
+    timing_by_name = {
+        item["metric_name"]: item for item in result["provider_details"]["timing_observations"]
+    }
+    assert timing_by_name["tokens_per_second"]["value"] > 0
+    assert timing_by_name["tokens_per_second"]["source"] == "adapter_instrumented"
+    assert timing_by_name["tokens_per_second"]["start_boundary"] == (
+        "model.generate.start_after_sync"
+    )
     backend.unload(str(checkpoint))
 
 

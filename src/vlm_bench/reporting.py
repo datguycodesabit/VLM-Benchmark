@@ -69,6 +69,49 @@ def _flat(row):
     }
 
 
+def _diagnostic_tables(report):
+    tables = {
+        "Operations": report.get("operational_summary", []),
+        "Timing": report.get("timing_breakdowns", []),
+        "Usage": report.get("usage_summary", []),
+        "Passes": [],
+        "Equivalence": [],
+        "Uncertainty": [],
+    }
+    for condition, evaluation in _evaluations(report):
+        for track, data in evaluation.get("tracks", {}).items():
+            for model in data.get("models", []):
+                common = {"condition": condition, "track": track, "model": model["model"]}
+                tables["Passes"].extend(dict(common, **item) for item in model.get("per_pass", []))
+                if isinstance(model.get("equivalence"), dict):
+                    equivalence = model["equivalence"]
+                    tables["Equivalence"].append(
+                        {
+                            **common,
+                            **equivalence.get("outcomes", {}),
+                            **{
+                                key: value
+                                for key, value in equivalence.items()
+                                if key not in {"outcomes", "witnesses"}
+                            },
+                        }
+                    )
+            uncertainty = data.get("uncertainty", {})
+            for model, interval in uncertainty.get("model_intervals", {}).items():
+                tables["Uncertainty"].append(
+                    {
+                        "condition": condition,
+                        "track": track,
+                        "model": model,
+                        **interval,
+                        "unit": uncertainty.get("unit"),
+                        "replicates": uncertainty.get("replicates"),
+                        "seed": uncertainty.get("seed"),
+                    }
+                )
+    return tables
+
+
 def _table(rows):
     if not rows:
         return '<p class="muted">No eligible samples in this track.</p>'
@@ -198,6 +241,16 @@ def _html(report):
                     + _table(passes)
                     + "</details>"
                 )
+            if track == "equation":
+                equations = [
+                    row
+                    for row in _diagnostic_tables(report)["Equivalence"]
+                    if row["condition"] == name
+                ]
+                if equations:
+                    parts.append(
+                        "<h4>Mathematical equivalence (diagnostic)</h4>" + _table(equations)
+                    )
             parts.append(
                 "<details><summary>Coverage, per-pass scores, uncertainty and equivalence</summary>"
             )
@@ -220,6 +273,16 @@ def _html(report):
             '<p class="muted">No instrumented breakdowns were recorded. '
             "Cloud internals and time to first output remain unavailable.</p>"
         )
+    parts.append("<h3>Observed token usage</h3>")
+    parts.append(
+        '<p class="muted">Token counts and rates use each model or provider tokenizer. '
+        "Different tokenizers are not directly interchangeable. Totals include only reported observations.</p>"
+    )
+    parts.append(
+        _table(report.get("usage_summary", []))
+        if report.get("usage_summary")
+        else '<p class="muted">Token usage was not reported. Unknown usage is not zero usage.</p>'
+    )
     context = {
         key: value
         for key, value in report.items()
@@ -261,19 +324,20 @@ def _evidence(report, source, target):
     """Attach bounded difficult examples and operational context to the shared model."""
     from .inspection import inspect_run
     from .runner import read_records
+    from .sources import source_plan
 
     source = Path(source).resolve()
-    if (source / "manifest.json").is_file():
-        paths = [source]
-    elif (source / "experiment.json").is_file():
-        paths = json.loads((source / "experiment.json").read_text())["runs"]
-    elif (source / "suite.json").is_file():
-        state = json.loads((source / "suite.json").read_text())
-        paths = [entry["run_dir"] for entry in state["runs"].values() if entry.get("run_dir")]
-    else:
-        paths = []
+    paths = (
+        [entry["path"] for entry in source_plan(source)["runs"]]
+        if any(
+            (source / marker).is_file()
+            for marker in ("manifest.json", "experiment.json", "suite.json")
+        )
+        else []
+    )
     examples, contexts, operations = [], [], []
     timings = defaultdict(list)
+    usage = {}
     for value in paths:
         directory = Path(value)
         if not directory.is_absolute():
@@ -346,6 +410,41 @@ def _evidence(report, source, target):
         for row in records:
             if row.get("cache_hit") or row.get("status") != "success":
                 continue
+            tokenization = (row.get("provider_details") or {}).get("tokenization")
+            key = (row["model"], row.get("usage_source", "unknown"), _text(tokenization))
+            summary = usage.setdefault(
+                key,
+                {
+                    "model": key[0],
+                    "source": key[1],
+                    "tokenization": tokenization,
+                    "successful_requests": 0,
+                    "requests_with_usage": 0,
+                    "input_tokens_observed": None,
+                    "output_tokens_observed": None,
+                    "cached_input_tokens_observed": None,
+                },
+            )
+            summary["successful_requests"] += 1
+            observed = row.get("usage")
+            if isinstance(observed, dict):
+                summary["requests_with_usage"] += 1
+                for field, aliases in (
+                    ("input_tokens", ("input_tokens", "prompt_tokens")),
+                    ("output_tokens", ("output_tokens", "completion_tokens")),
+                    ("cached_input_tokens", ("cached_input_tokens", "cached_tokens")),
+                ):
+                    value = next((observed[name] for name in aliases if name in observed), None)
+                    details = observed.get("input_tokens_details")
+                    if (
+                        field == "cached_input_tokens"
+                        and value is None
+                        and isinstance(details, dict)
+                    ):
+                        value = details.get("cached_tokens")
+                    if type(value) in (int, float) and math.isfinite(value) and value >= 0:
+                        column = field + "_observed"
+                        summary[column] = (summary[column] or 0) + value
             for timing in row.get("timing_observations", []):
                 value = timing.get("value")
                 if (
@@ -410,6 +509,10 @@ def _evidence(report, source, target):
             examples.append(example)
     report["measurement_context"] = contexts
     report["difficult_examples"] = examples
+    report["usage_summary"] = [
+        dict(value, coverage=value["requests_with_usage"] / value["successful_requests"])
+        for value in usage.values()
+    ]
     report["operational_summary"] = operations
     report["timing_breakdowns"] = [
         dict(
@@ -421,20 +524,87 @@ def _evidence(report, source, target):
     ]
 
 
-def write_report(source, output=None, *, formats=("html", "xlsx", "csv", "json"), policy=None):
-    """Evaluate saved evidence once; render every format from the exact same model."""
+def load_report_model(source, *, policy=None):
+    """Load portable derived reports, or evaluate raw saved artifacts when available."""
     from .report_model import build_report
 
+    path = Path(source).expanduser().resolve()
+    if path.is_file() and path.name == "manifest.json":
+        path = path.parent
+    marker = path
+    if path.is_dir() and not any(
+        (path / name).is_file() for name in ("manifest.json", "experiment.json", "suite.json")
+    ):
+        marker = path / (
+            "comparison.json" if (path / "comparison.json").is_file() else "evaluation.json"
+        )
+    if marker.is_file() and marker.name in {"comparison.json", "evaluation.json"}:
+        value = json.loads(marker.read_text(encoding="utf-8"))
+        if (
+            not isinstance(value, dict)
+            or type(value.get("evaluation_schema_version")) is not int
+            or value.get("evaluation_schema_version") != 2
+            or not isinstance(value.get("conditions"), dict)
+        ):
+            raise ValueError(
+                "Unsupported derived report; regenerate from the original run artifacts"
+            )
+        if type(value.get("report_model_version", 1)) is not int or value.get(
+            "report_model_version", 1
+        ) not in {1, 2}:
+            raise ValueError(
+                "Unsupported report model version; regenerate from the original run artifacts"
+            )
+        if policy is not None:
+            raise ValueError("Policy changes require original run artifacts, not a derived report")
+        return value
+    return build_report(path, policy=policy)
+
+
+def write_report(source, output=None, *, formats=("html", "xlsx", "csv", "json"), policy=None):
+    """Evaluate saved evidence once; render every format from the exact same model."""
     formats = tuple(formats)
     invalid = set(formats) - {"html", "xlsx", "csv", "json"}
     if invalid:
         raise ValueError(f"Unsupported report formats: {sorted(invalid)}")
-    report = build_report(Path(source), policy=policy)
-    target = Path(output) if output else Path(source) / "report"
+    report = load_report_model(source, policy=policy)
+    source = Path(source).expanduser().resolve()
+    if source.is_file():
+        source = source.parent
+    derived = not any(
+        (source / name).is_file() for name in ("manifest.json", "experiment.json", "suite.json")
+    )
+    target = Path(output) if output else source if derived else source / "report"
     target.mkdir(parents=True, exist_ok=True)
-    _evidence(report, source, target)
+    if derived:
+        for example in report.get("difficult_examples", []):
+            if not example.get("image"):
+                continue
+            image = (source / example["image"]).resolve()
+            if not image.is_relative_to((source / "assets").resolve()) or not image.is_file():
+                raise ValueError("Derived report image is missing or escapes its assets directory")
+            if hashlib.sha256(image.read_bytes()).hexdigest() != image.stem:
+                raise ValueError("Derived report image hash does not match its saved identity")
+            assets = target / "assets"
+            assets.mkdir(exist_ok=True)
+            destination = assets / image.name
+            if destination.resolve() != image:
+                shutil.copyfile(image, destination)
+    else:
+        _evidence(report, source, target)
+    return render_report(report, target, formats=formats)
+
+
+def render_report(report, target, *, formats=("html", "xlsx", "csv", "json")):
+    """Render a prebuilt report model without reading artifacts or loading providers."""
+    invalid = set(formats) - {"html", "xlsx", "csv", "json"}
+    if invalid:
+        raise ValueError(f"Unsupported report formats: {sorted(invalid)}")
+    target = Path(target)
+    target.mkdir(parents=True, exist_ok=True)
     paths = []
     rows = [_flat(row) for row in _leaderboards(report)]
+    diagnostic_tables = _diagnostic_tables(report)
     fields = list(dict.fromkeys(key for row in rows for key in row)) or [
         "condition",
         "track",
@@ -455,6 +625,17 @@ def write_report(source, output=None, *, formats=("html", "xlsx", "csv", "json")
             writer.writeheader()
             writer.writerows({key: _csv_value(row.get(key)) for key in fields} for row in rows)
         paths.append(path)
+        for title, table in diagnostic_tables.items():
+            if table:
+                diagnostic_path = target / f"{title.lower()}.csv"
+                columns = list(dict.fromkeys(key for row in table for key in row))
+                with diagnostic_path.open("w", encoding="utf-8-sig", newline="") as stream:
+                    writer = csv.DictWriter(stream, columns)
+                    writer.writeheader()
+                    writer.writerows(
+                        {key: _csv_value(row.get(key)) for key in columns} for row in table
+                    )
+                paths.append(diagnostic_path)
     if "xlsx" in formats:
         from openpyxl import Workbook
         from openpyxl.styles import Font, PatternFill
@@ -493,18 +674,7 @@ def write_report(source, output=None, *, formats=("html", "xlsx", "csv", "json")
             sheet.column_dimensions[get_column_letter(index)].width = min(
                 52, max(18, len(field) + 3)
             )
-        tables = {
-            "Operations": report.get("operational_summary", []),
-            "Timing": report.get("timing_breakdowns", []),
-            "Passes": [
-                {"condition": condition, "track": track, "model": model["model"], **item}
-                for condition, evaluation in _evaluations(report)
-                for track, data in evaluation.get("tracks", {}).items()
-                for model in data.get("models", [])
-                for item in model.get("per_pass", [])
-            ],
-        }
-        for title, table in tables.items():
+        for title, table in diagnostic_tables.items():
             if table:
                 columns = list(dict.fromkeys(key for row in table for key in row))
                 _append_table(workbook.create_sheet(title), title, columns, table, overflow)

@@ -136,6 +136,22 @@ def test_dry_run_never_transcribes(paired):
     assert Backend.calls == []
 
 
+def test_ollama_streaming_setting_is_frozen_as_an_effective_control(paired, tmp_path):
+    directory = engine.run(
+        paired,
+        ["ollama:first"],
+        tmp_path / "runs",
+        settings={"ollama:first": {"streaming": True}},
+        warmup=False,
+        backend_factory=Backend,
+    )
+
+    manifest = json.loads((directory / "manifest.json").read_text())
+    controls = manifest["provider_controls"]["ollama:first"]
+    assert controls["requested"]["streaming"] is True
+    assert controls["effective"]["streaming"] is True
+
+
 def test_new_policy_and_measurement_profile_are_frozen_for_resume(paired, tmp_path):
     from vlm_bench.scoring_policy import ScoringPolicy
 
@@ -358,6 +374,145 @@ def test_experiment_resume_rebases_relative_paths_after_move(paired, tmp_path):
     assert all(Path(sample["crop_path"]).is_file() for sample in manifest["samples"])
 
 
+def _experiment_plan_kwargs(planned_passes, **overrides):
+    from vlm_bench.scoring_policy import ScoringPolicy
+
+    values = {
+        "base_url": "http://localhost:11434",
+        "timeout": 300,
+        "num_predict": 4096,
+        "warmup": False,
+        "settings": {},
+        "costs": {},
+        "max_retries": 2,
+        "concurrency": 1,
+        "max_requests": None,
+        "max_spend_usd": None,
+        "cache_dir": None,
+        "strict_research": False,
+        "protocol": "document-disjoint",
+        "formula_rendering": False,
+        "scoring_policy": ScoringPolicy().to_dict(),
+        "measurement_profile": {"profile": "latency", "concurrency": 1, "batch_size": 1},
+        "planned_passes": planned_passes,
+    }
+    values.update(overrides)
+    return values
+
+
+def test_experiment_resume_uses_persisted_plan_before_any_run_exists(paired, tmp_path):
+    from vlm_bench import experiments
+    from vlm_bench.snapshot import freeze
+
+    metadata = [
+        {
+            "id": f"s{i}",
+            "split": "test",
+            "verification_status": "verified",
+            "source_document": f"document-{i}",
+            "writer_id": f"writer-{i}",
+        }
+        for i in range(3)
+    ]
+    (paired / "metadata.jsonl").write_text(
+        "".join(json.dumps(record) + "\n" for record in metadata)
+    )
+    experiment_dir = tmp_path / "experiment"
+    prepared = experiment_dir / "prepared"
+    freeze(paired, prepared)
+    (experiment_dir / "experiment.json").write_text(
+        json.dumps({"schema_version": 1, "planned_passes": 2, "runs": []})
+    )
+    audit = engine._audit_source(paired, "auto", "document-disjoint")
+    kwargs = _experiment_plan_kwargs(
+        2,
+        strict_research=True,
+        frozen_source_audit=audit,
+        frozen_validation_scope="source-dataset-and-selected-test-samples",
+    )
+    plan_inputs = experiments.initialize_experiment_plan(
+        experiment_dir,
+        planned_passes=2,
+        prepared=prepared,
+        models=["ollama:first"],
+        run_kwargs=kwargs,
+    )
+
+    result = experiments.resume_experiment(
+        experiment_dir,
+        backend_factory=Backend,
+        progress=lambda _message: None,
+    )
+
+    state = json.loads((experiment_dir / "experiment.json").read_text())
+    manifests = [
+        json.loads((experiment_dir / run / "manifest.json").read_text()) for run in state["runs"]
+    ]
+    assert plan_inputs == prepared
+    assert result == experiment_dir.resolve()
+    assert state["status"] == "complete"
+    assert len(Backend.calls) == 6
+    assert [manifest["repetition"] for manifest in manifests] == [1, 2]
+    assert all(manifest["source_audit"] == audit for manifest in manifests)
+    assert all(
+        manifest["validation_scope"] == "source-dataset-and-selected-test-samples"
+        for manifest in manifests
+    )
+
+
+def test_experiment_resume_discovers_unrecorded_pass_and_keeps_budget_override_invocation_only(
+    paired, tmp_path
+):
+    from vlm_bench import experiments
+    from vlm_bench.snapshot import freeze
+
+    experiment_dir = tmp_path / "experiment"
+    prepared = experiment_dir / "prepared"
+    freeze(paired, prepared)
+    (experiment_dir / "experiment.json").write_text(
+        json.dumps({"schema_version": 1, "planned_passes": 2, "runs": []})
+    )
+    plan_kwargs = _experiment_plan_kwargs(2, max_requests=1)
+    experiments.initialize_experiment_plan(
+        experiment_dir,
+        planned_passes=2,
+        prepared=prepared,
+        models=["ollama:first"],
+        run_kwargs=plan_kwargs,
+    )
+    orphan = engine.run(
+        None,
+        ["ollama:first"],
+        experiment_dir / "runs",
+        prepared=prepared,
+        **plan_kwargs,
+        suite_condition="baseline",
+        repetition=1,
+        repeated_measurement=True,
+        backend_factory=Backend,
+    )
+    calls_after_orphan = len(Backend.calls)
+
+    experiments.resume_experiment(
+        experiment_dir,
+        max_requests=4,
+        backend_factory=Backend,
+        progress=lambda _message: None,
+    )
+
+    state = json.loads((experiment_dir / "experiment.json").read_text())
+    assert len(state["runs"]) == 2
+    assert experiment_dir / state["runs"][0] == orphan
+    assert calls_after_orphan == 1
+    assert len(Backend.calls) == 6
+    second_dir = experiment_dir / state["runs"][1]
+    second_manifest = json.loads((second_dir / "manifest.json").read_text())
+    second_execution = json.loads((second_dir / "execution.json").read_text())
+    assert second_manifest["max_requests"] == 1
+    assert second_manifest["execution_controls"]["max_requests"] == 1
+    assert second_execution["invocations"][0]["execution_controls"]["max_requests"] == 4
+
+
 def test_strict_source_run_uses_test_split_and_persists_audit(paired, tmp_path):
     metadata = [
         {
@@ -433,6 +588,26 @@ def test_strict_source_run_rejects_cross_split_document_leakage(paired, tmp_path
         )
 
     assert Backend.calls == []
+    assert not (tmp_path / "runs").exists()
+
+
+def test_adapter_batch_capability_cannot_enable_unimplemented_batch_dispatch(paired, tmp_path):
+    from vlm_bench.adapters import BackendCapabilities
+
+    class BatchBackend(Backend):
+        capabilities = BackendCapabilities(batching=True)
+
+    with pytest.raises(ValueError, match="batch_size greater than 1|Batch sizes above 1"):
+        engine.run(
+            paired,
+            ["ollama:first"],
+            tmp_path / "runs",
+            warmup=False,
+            measurement_profile={"profile": "throughput", "concurrency": 1, "batch_size": 2},
+            backend_factory=BatchBackend,
+        )
+
+    assert BatchBackend.calls == []
     assert not (tmp_path / "runs").exists()
 
 

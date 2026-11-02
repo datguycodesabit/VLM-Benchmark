@@ -14,6 +14,7 @@ def test_default_policy_is_versioned_and_matches_product_weights():
         "missing_and_failed_as_empty": True,
         "pass_aggregation": "arithmetic_mean",
         "normalization": "whitespace-v1",
+        "equation_normalization": "unicode-nfc-whitespace-v1",
     }
 
 

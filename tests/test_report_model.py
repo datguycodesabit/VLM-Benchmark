@@ -154,6 +154,42 @@ def test_throughput_or_concurrent_profile_does_not_supply_ranking_latency():
     assert result["throughput"]["throughput_denominator"] == "workload_wall_seconds"
 
 
+def test_incomplete_invocation_timing_never_produces_a_partial_throughput_rate():
+    result = report_model.evaluate_run(
+        [_sample("p", "abc")],
+        [_record("m", "p", "abc")],
+        manifest={
+            "measurement_profile": {"profile": "throughput", "concurrency": 4},
+            "execution_runs": [
+                {
+                    "pass": 1,
+                    "invocations": [
+                        {
+                            "status": "incomplete",
+                            "workload_wall_seconds": 1.0,
+                        },
+                        {
+                            "status": "complete",
+                            "workload_wall_seconds": None,
+                            "successful_sample_count": 4,
+                            "terminal_sample_count": 4,
+                            "throughput_numerator": "successful_uncached_sample_results",
+                            "throughput_denominator": "workload_wall_seconds_cumulative",
+                            "terminal_throughput_numerator": "terminal_sample_results",
+                        },
+                    ],
+                }
+            ],
+        },
+    )
+
+    throughput = result["throughput"]
+    assert throughput["status"] == "partial"
+    assert throughput["successful_samples_per_second"] is None
+    assert throughput["throughput_denominator"] == "workload_wall_seconds_cumulative"
+    assert throughput["terminal_throughput_numerator"] == "terminal_sample_results"
+
+
 def test_different_model_rosters_clear_all_comparable_placements():
     result = report_model.evaluate_run(
         [_sample("a", "abc"), _sample("b", "def")],
@@ -173,6 +209,50 @@ def test_different_model_rosters_clear_all_comparable_placements():
     assert all(row["rank"] is None for row in track["models"])
 
 
+def test_partial_unsupported_status_is_penalized_and_withholds_final_placement():
+    result = report_model.evaluate_run(
+        [_sample("p", "abcd")],
+        [
+            _record("model-a", "p", None, pass_index=1, status="unsupported"),
+            _record("model-a", "p", "abcd", pass_index=2),
+            _record("model-b", "p", "abcd", pass_index=1),
+            _record("model-b", "p", "abcd", pass_index=2),
+        ],
+        models=["model-a", "model-b"],
+        planned_passes=2,
+    )
+    track = result["tracks"]["prose"]
+    model_a = next(row for row in track["models"] if row["model"] == "model-a")
+
+    assert model_a["eligible_sample_ids"] == ["p"]
+    assert model_a["inconsistent_unsupported_sample_ids"] == ["p"]
+    assert model_a["failed_sample_count"] == 1
+    assert model_a["score"] == 50
+    assert track["ranking"]["winner"] is None
+    assert track["ranking"]["winner_reason"] == "incomplete_evaluation"
+
+
+def test_frozen_unsupported_manifest_excludes_sample_across_all_passes():
+    result = report_model.evaluate_run(
+        [_sample("p", "abcd")],
+        [
+            _record("model-a", "p", None, pass_index=1, status="unsupported"),
+            _record("model-b", "p", "abcd", pass_index=1),
+            _record("model-b", "p", "abcd", pass_index=2),
+        ],
+        models=["model-a", "model-b"],
+        planned_passes=2,
+        manifest={"unsupported_sample_ids": {"model-a": ["p"]}},
+    )
+    track = result["tracks"]["prose"]
+    model_a = next(row for row in track["models"] if row["model"] == "model-a")
+
+    assert model_a["unsupported_sample_ids"] == ["p"]
+    assert model_a["eligible_sample_count"] == 0
+    assert not model_a["inconsistent_unsupported_sample_ids"]
+    assert track["models"][1]["score"] == 100
+
+
 def test_report_ids_are_evidence_and_policy_specific_and_future_schema_is_rejected():
     samples = [_sample("p", "abc")]
     first = report_model.evaluate_run(samples, [_record("m", "p", "abc")])
@@ -183,6 +263,8 @@ def test_report_ids_are_evidence_and_policy_specific_and_future_schema_is_reject
     assert first["evaluation_id"] != changed["evaluation_id"]
     with pytest.raises(ValueError, match="unsupported evaluation schema version"):
         report_model.evaluate_run(samples, [], manifest={"evaluation_schema_version": 99})
+    with pytest.raises(ValueError, match="unsupported evaluation schema version"):
+        report_model.evaluate_run(samples, [], manifest={"evaluation_schema_version": 2.0})
 
 
 def test_build_report_groups_experiment_passes_and_suite_conditions_independently(
@@ -218,6 +300,7 @@ def test_build_report_groups_experiment_passes_and_suite_conditions_independentl
     experiment.write_text(
         json.dumps(
             {
+                "schema_version": 1,
                 "evaluation_schema_version": 2,
                 "condition": "default",
                 "planned_passes": 2,
@@ -234,17 +317,37 @@ def test_build_report_groups_experiment_passes_and_suite_conditions_independentl
         experiment_report["conditions"]["default"]["tracks"]["prose"]["models"][0]["score"] == 100
     )
 
+    suite_runs = tmp_path / "runs"
+    suite_run_a = suite_runs / "a-suite-run-1"
+    suite_run_b = suite_runs / "b-suite-run-1"
+    suite_runs.mkdir()
+    suite_run_a.mkdir()
+    suite_run_b.mkdir()
     suite_manifest = {
         "schema_version": 1,
         "suite_id": "suite",
         "status": "complete",
+        "normalized_suite": {
+            "conditions": [
+                {"name": "prompt-a", "repeats": 1},
+                {"name": "prompt-b", "repeats": 1},
+            ]
+        },
         "conditions": [
             {"name": "prompt-a", "repeats": 1, "benchmark_fingerprint": "fp-a"},
             {"name": "prompt-b", "repeats": 1, "benchmark_fingerprint": "fp-b"},
         ],
         "runs": {
-            "prompt-a\u00001": {"condition": "prompt-a", "repetition": 1, "run_dir": str(run_a)},
-            "prompt-b\u00001": {"condition": "prompt-b", "repetition": 1, "run_dir": str(run_c)},
+            "prompt-a\u00001": {
+                "condition": "prompt-a",
+                "repetition": 1,
+                "run_dir": str(suite_run_a),
+            },
+            "prompt-b\u00001": {
+                "condition": "prompt-b",
+                "repetition": 1,
+                "run_dir": str(suite_run_b),
+            },
         },
         "config_sha256": "a" * 64,
     }
@@ -282,6 +385,13 @@ def test_build_report_does_not_apply_default_weighted_policy_to_legacy_run(tmp_p
     assert result["policy"] is None
     assert result["conditions"]["baseline"]["status"] == "legacy_policy_unavailable"
     assert result["conditions"]["baseline"]["legacy_scoring_version"] == "1"
+    assert result["raw_evidence_id"]
+
+    rescored = report_model.build_report(run_dir, policy={"version": 1})
+    evaluation = rescored["conditions"]["baseline"]
+    assert rescored["raw_evidence_id"] == result["raw_evidence_id"]
+    assert evaluation["provenance"]["scoring_policy_source"] == "explicit_override"
+    assert evaluation["provenance"]["rescore_of"] == evaluation["raw_evidence_id"]
 
 
 def test_direct_physical_pass_preserves_manifest_repetition_identity(tmp_path, monkeypatch):
@@ -327,6 +437,58 @@ def test_evaluation_identity_changes_with_uncertainty_policy():
     assert len({row["evaluation_id"] for row in (first, second, third)}) == 3
 
 
+def test_rescoring_keeps_raw_evidence_identity_and_records_its_source():
+    samples = [_sample("p", "abcd")]
+    records = [_record("m", "p", "abce", metrics={"cer": 0.25})]
+    original = report_model.evaluate_run(samples, records)
+    rescored = report_model.evaluate_run(
+        samples,
+        records,
+        policy={"version": 1, "character_accuracy_weight": 0.6, "exact_match_weight": 0.4},
+        manifest={"scoring_policy": {"version": 1}},
+    )
+
+    assert original["raw_evidence_id"] == rescored["raw_evidence_id"]
+    assert original["evaluation_id"] != rescored["evaluation_id"]
+    assert rescored["provenance"]["scoring_policy_source"] == "explicit_override"
+    assert rescored["provenance"]["rescore_of"] == original["raw_evidence_id"]
+
+
+def test_unstarted_experiment_plan_reports_all_missing_cells_offline(tmp_path):
+    from PIL import Image
+
+    from vlm_bench.experiments import initialize_experiment_plan
+    from vlm_bench.snapshot import freeze
+
+    data = tmp_path / "dataset"
+    (data / "images").mkdir(parents=True)
+    (data / "text").mkdir()
+    Image.new("RGB", (40, 20), "white").save(data / "images" / "one.png")
+    (data / "text" / "one.txt").write_text("read me", encoding="utf-8")
+
+    experiment = tmp_path / "experiment"
+    prepared = experiment / "prepared"
+    freeze(data, prepared)
+    initialize_experiment_plan(
+        experiment,
+        planned_passes=3,
+        prepared=prepared,
+        models=["provider:model"],
+        run_kwargs={"scoring_policy": {"version": 1}},
+    )
+
+    result = report_model.build_report(experiment / "experiment.json")
+    evaluation = result["conditions"]["baseline"]
+    model = evaluation["tracks"]["prose"]["models"][0]
+
+    assert evaluation["run_status"] == "incomplete"
+    assert model["score"] == 0
+    assert model["missing_sample_count"] == 3
+    assert model["sample_coverage"] == 0
+    assert evaluation["tracks"]["prose"]["ranking"]["winner"] is None
+    assert evaluation["tracks"]["prose"]["ranking"]["winner_reason"] == "incomplete_evaluation"
+
+
 def test_imported_timings_without_measurement_profile_do_not_resolve_speed():
     samples = [_sample("one", "abc")]
     records = [_record("external:test", "one", "abc", latency_seconds=0.1)]
@@ -337,3 +499,32 @@ def test_imported_timings_without_measurement_profile_do_not_resolve_speed():
     assert track["models"][0]["score"] == 100
     assert track["ranking"]["winner"] is None
     assert not track["speed_comparable"]
+
+
+def test_measured_report_size_scales_with_metrics_not_raw_observations():
+    samples = [_sample(f"s{i}", "abc", document_id=f"doc-{i // 10}") for i in range(1000)]
+    observation = {
+        "metric_name": "decode",
+        "value": 0.2,
+        "unit": "seconds",
+        "source": "provider_reported",
+        "start_boundary": "decode.start",
+        "end_boundary": "decode.end",
+        "unavailable_reason": None,
+    }
+    records = [
+        _record(
+            "m",
+            f"s{i}",
+            "abc",
+            latency_seconds=0.4,
+            timing_observations=[dict(observation, value=0.2 + i / 10000)],
+        )
+        for i in range(1000)
+    ]
+    result = report_model.evaluate_run(samples, records, bootstrap_replicates=10)
+    timings = result["tracks"]["prose"]["models"][0]["per_pass"][0]["timing_observations"]
+    assert len(timings) == 1
+    assert timings[0]["count"] == timings[0]["measured_count"] == 1000
+    assert timings[0]["aggregation"] == "median"
+    assert len(json.dumps(result)) < 100000
