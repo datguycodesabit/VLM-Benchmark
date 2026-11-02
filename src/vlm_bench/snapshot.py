@@ -23,7 +23,7 @@ _MANIFEST_NAME = "dataset-manifest.json"
 _SNAPSHOT_VERSION = 2
 _SHA256_RE = re.compile(r"^[0-9a-f]{64}$")
 _LAYOUTS = {"auto", "paired", "iam-words", "iam-lines", "iam-forms"}
-_PREPROCESSING = {"original", "enhanced"}
+_PREPROCESSING = {"original", "padded", "enhanced"}
 _SPLITS = {"train", "validation", "test"}
 _CONTENT_TYPES = {"prose", "equation", "word"}
 _MAX_SEED = 2**32 - 1
@@ -166,7 +166,7 @@ def _validate_prepare_options(options: dict[str, Any]) -> None:
 
     preprocess = options.get("preprocess", "original")
     if not isinstance(preprocess, str) or preprocess not in _PREPROCESSING:
-        raise ValueError("preprocess must be original or enhanced")
+        raise ValueError("preprocess must be original, padded, or enhanced")
 
     split = options.get("split")
     if split is not None and (not isinstance(split, str) or split not in _SPLITS):

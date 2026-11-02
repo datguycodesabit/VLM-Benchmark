@@ -471,7 +471,7 @@ def _validate_url(base_url):
 def _controls(provider, options, settings, info):
     requested = dict(options, **settings)
     supported = {
-        "ollama": {"num_predict", "temperature", "seed", "streaming"},
+        "ollama": {"num_predict", "temperature", "seed", "streaming", "collect_resources"},
         "trocr": {"num_predict", "num_beams", "device", "revision"},
         "openai": {"num_predict", "image_detail", "reasoning_effort"},
         "chatgpt": {"image_detail", "reasoning_effort"},
@@ -1460,6 +1460,10 @@ def _execute(
                                 estimate=estimate,
                                 warmup=True,
                             )
+                            if provider == "ollama" and settings.get("collect_resources"):
+                                observe = getattr(backend, "observe_resources", None)
+                                if callable(observe):
+                                    warmup_result["resource_observation"] = observe(name)
                             warmup_result.update(status="success", response=raw)
                             break
                     warmup_result["latency_seconds"] = time.perf_counter() - started_at

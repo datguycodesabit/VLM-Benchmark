@@ -225,6 +225,51 @@ class OllamaBackend(Backend):
         self._model_identities[model] = identity
         return identity
 
+    def observe_resources(self, model):
+        """Sample loaded-model allocation after warmup, never during ranked requests.
+
+        Ollama's allocation is a snapshot, not peak RAM, power, or accelerator
+        utilization. A failed observation must not invalidate a transcription.
+        """
+        observation = {
+            "source": "ollama.api.ps",
+            "boundary": "after_warmup",
+            "is_peak": False,
+            "allocated_bytes": None,
+            "size_vram_bytes": None,
+            "context_length": None,
+        }
+        try:
+            payload = self.client._request_json("GET", "/api/ps")
+            models = payload.get("models", [])
+            identity = self._model_identities.get(model, {})
+            matching = next(
+                (
+                    item
+                    for item in models
+                    if item.get("digest") == identity.get("digest")
+                    and identity.get("digest")
+                    or self.client._model_names_match(
+                        model, str(item.get("name", item.get("model", "")))
+                    )
+                ),
+                None,
+            )
+            if matching is None:
+                raise ValueError("Requested model was not present in the loaded-model snapshot")
+            for source, target in (
+                ("size", "allocated_bytes"),
+                ("size_vram", "size_vram_bytes"),
+                ("context_length", "context_length"),
+            ):
+                value = matching.get(source)
+                if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                    observation[target] = value
+            observation["unavailable_reason"] = None
+        except (RuntimeError, OSError, ValueError, TypeError, AttributeError) as exc:
+            observation["unavailable_reason"] = str(exc)
+        return observation
+
     def transcribe(self, model, image_path, prompt, options):
         streaming = options.get("streaming", self.settings.get("streaming", False))
         if not isinstance(streaming, bool):
@@ -232,7 +277,14 @@ class OllamaBackend(Backend):
         clean_options = {
             key: value
             for key, value in options.items()
-            if key not in {"image_detail", "reasoning_effort", "max_output_tokens", "streaming"}
+            if key
+            not in {
+                "image_detail",
+                "reasoning_effort",
+                "max_output_tokens",
+                "streaming",
+                "collect_resources",
+            }
             and not key.startswith("_vlm_bench_")
         }
         client_timings = None

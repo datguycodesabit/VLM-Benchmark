@@ -1,5 +1,8 @@
 # VLM Benchmark CLI workflow
 
+For the controlled 3B/7B handwriting diagnostic experiment and human review,
+see [DIAGNOSTIC_STUDY.md](DIAGNOSTIC_STUDY.md).
+
 The product requirements are in [PRODUCT_SPEC.md](PRODUCT_SPEC.md); the engineering
 contracts are in [ARCHITECTURE.md](ARCHITECTURE.md). New configuration version 3
 freezes the weighted policy and measurement profile. Existing version 1/2

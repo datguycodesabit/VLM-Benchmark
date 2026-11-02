@@ -241,7 +241,7 @@ def _dataset_options(command):
     command.add_argument(
         "--layout", choices=["auto", "paired", "iam-words", "iam-lines", "iam-forms"], default=None
     )
-    command.add_argument("--preprocess", choices=["original", "enhanced"], default=None)
+    command.add_argument("--preprocess", choices=["original", "padded", "enhanced"], default=None)
     command.add_argument("--split", choices=["train", "validation", "test"])
     command.add_argument("--content-type", choices=["prose", "equation", "word"])
 
@@ -1002,7 +1002,7 @@ def main(argv=None):
             failed = False
             for profile in profiles:
                 if profile is not None:
-                    if profile not in {"original", "enhanced"}:
+                    if profile not in {"original", "padded", "enhanced"}:
                         raise ValueError("Unknown preprocessing profile")
                     options["preprocess"] = profile
                 if args.dry_run:

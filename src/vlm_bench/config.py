@@ -42,6 +42,7 @@ _SELECTION_FIELDS = {
     "content_type",
 }
 _MODEL_SETTINGS = {
+    "collect_resources",
     "device",
     "revision",
     "num_predict",
@@ -55,7 +56,7 @@ _MODEL_SETTINGS = {
 _REASONING_EFFORTS = {"none", "minimal", "low", "medium", "high", "xhigh", "max", "ultra"}
 _SPLITS = {"train", "validation", "test"}
 _LAYOUTS = {"auto", "paired", "iam-words", "iam-lines", "iam-forms"}
-_PROFILES = {"original", "enhanced"}
+_PROFILES = {"original", "padded", "enhanced"}
 _CONTENT_TYPES = {"prose", "equation", "word"}
 _PROTOCOLS = {"document-disjoint", "writer-disjoint"}
 _MAX_SEED = 2**32 - 1
@@ -123,6 +124,8 @@ def _validate_model_settings(settings: Any, context: str) -> dict[str, Any]:
         raise ValueError(f"Unsupported settings for {context}; credentials must not be in TOML")
 
     result = dict(settings)
+    if "collect_resources" in result and not isinstance(result["collect_resources"], bool):
+        raise ValueError(f"collect_resources for {context} must be a boolean")
     if "streaming" in result and not isinstance(result["streaming"], bool):
         raise ValueError(f"streaming for {context} must be a boolean")
     if "device" in result and (
@@ -198,6 +201,8 @@ def validate_settings(
             continue
         provider, _ = _selector(selector, "model settings")
         canonical_options = _validate_model_settings(options, str(selector))
+        if "collect_resources" in canonical_options and provider != "ollama":
+            raise ValueError("Settings collect_resources is only supported for provider 'ollama'")
         if "streaming" in canonical_options and provider != "ollama":
             raise ValueError("Settings streaming is only supported for provider 'ollama'")
         if provider == "external" and canonical_options:
@@ -284,7 +289,7 @@ def _validate_experiment(experiment: Any, base: Path) -> dict[str, Any]:
         raise ValueError("experiment.layout must be a supported dataset layout")
     for name in ("preprocess",):
         if name in result and (not isinstance(result[name], str) or result[name] not in _PROFILES):
-            raise ValueError(f"experiment.{name} must be original or enhanced")
+            raise ValueError(f"experiment.{name} must be original, padded, or enhanced")
     if "preprocessing" in result:
         profiles = result["preprocessing"]
         if (

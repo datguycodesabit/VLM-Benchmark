@@ -379,14 +379,16 @@ def _save_model_crop(
     destination.parent.mkdir(parents=True, exist_ok=True)
     with Image.open(source) as image:
         crop = image.crop(bbox)
-        if preprocess == "enhanced":
-            crop = crop.convert("L")
-            crop = ImageOps.autocontrast(crop)
+        if preprocess in {"enhanced", "padded"}:
+            if preprocess == "enhanced":
+                crop = crop.convert("L")
+                crop = ImageOps.autocontrast(crop)
+            crop = crop.convert("RGB") if preprocess == "padded" else crop
             crop = crop.resize(
                 (crop.width * _MODEL_SCALE, crop.height * _MODEL_SCALE),
                 Image.Resampling.LANCZOS,
             )
-            crop = ImageOps.expand(crop, border=_MODEL_BORDER, fill=255)
+            crop = ImageOps.expand(crop, border=_MODEL_BORDER, fill="white")
         crop.save(destination, format="PNG")
 
 
@@ -1582,6 +1584,7 @@ def prepare_dataset(
     ``original`` preserves input pixels; ``enhanced`` applies grayscale,
     contrast normalization, 3x enlargement, and white padding. A prepared
     manifest freezes selected IDs, references, hashes, and metadata.
+    ``padded`` enlarges 3x and adds white padding without contrast normalization.
     """
     data_dir = Path(data_dir).expanduser().resolve()
     output_dir = Path(output_dir).expanduser().resolve()
@@ -1589,8 +1592,8 @@ def prepare_dataset(
         raise ValueError("min_pixels must be a nonnegative integer")
     if limit is not None and limit <= 0:
         raise ValueError("limit must be a positive integer when provided")
-    if preprocess not in {"original", "enhanced"}:
-        raise ValueError("preprocess must be 'original' or 'enhanced'")
+    if preprocess not in {"original", "padded", "enhanced"}:
+        raise ValueError("preprocess must be 'original', 'padded', or 'enhanced'")
     if split is not None and split not in _SPLITS:
         raise ValueError("split must be 'train', 'validation', or 'test'")
     if content_type is not None and not content_type.strip():
