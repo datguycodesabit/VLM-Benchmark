@@ -159,6 +159,56 @@ def _filter_metadata_records(
     return filtered
 
 
+def _filter_pixel_records(records, output_dir, min_pixels):
+    """Filter native crop area before enlargement and random subset selection."""
+    if not min_pixels:
+        return records
+    retained, excluded = [], []
+    for record in records:
+        box = record.get("crop_bbox")
+        if box is None:
+            # Forms include the same clipped context border used by the cropper.
+            with Image.open(record["image_path"]) as image:
+                image_width, image_height = image.size
+            x1, y1, x2, y2 = record["union_box"]
+            box = (
+                max(0, x1 - _PADDING),
+                max(0, y1 - _PADDING),
+                min(image_width, x2 + _PADDING),
+                min(image_height, y2 + _PADDING),
+            )
+        width, height = box[2] - box[0], box[3] - box[1]
+        if width * height >= min_pixels:
+            retained.append(record)
+        else:
+            excluded.append(
+                {
+                    "sample_id": record["id"],
+                    "width": width,
+                    "height": height,
+                    "pixels": width * height,
+                    "reason": "below_min_pixels",
+                }
+            )
+    if not retained:
+        raise ValueError(f"No samples meet min_pixels={min_pixels}; all {len(records)} excluded")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    audit = {
+        "schema_version": 1,
+        "min_pixels": min_pixels,
+        "measurement": "native_crop_width_times_height_before_preprocessing",
+        "selection_stage": "after_metadata_filters_before_random_sampling",
+        "candidate_count": len(records),
+        "eligible_count": len(retained),
+        "excluded_count": len(excluded),
+        "excluded": excluded,
+    }
+    (output_dir / "image-size-filter.json").write_text(
+        json.dumps(audit, indent=2) + "\n", encoding="utf-8"
+    )
+    return retained
+
+
 def _manifest_sample(sample: dict[str, Any], preprocess: str) -> dict[str, Any]:
     return {
         "id": sample["id"],
@@ -461,6 +511,7 @@ def _prepare_paired_dataset(
     preprocess: str,
     split: str | None,
     content_type: str | None,
+    min_pixels: int = 0,
 ) -> list[dict[str, Any]]:
     """Prepare generic images and references matched by relative path and stem."""
     reference_name, image_by_id, reference_by_id = _paired_paths(data_dir)
@@ -502,6 +553,7 @@ def _prepare_paired_dataset(
             }
         )
     records = _filter_metadata_records(records, split, content_type)
+    records = _filter_pixel_records(records, output_dir, min_pixels)
     if limit is not None:
         if limit > len(records):
             raise ValueError(f"Requested {limit} samples, but only {len(records)} are available")
@@ -564,6 +616,7 @@ def _prepare_line_dataset(
     preprocess: str,
     split: str | None,
     content_type: str | None,
+    min_pixels: int = 0,
 ) -> list[dict[str, Any]]:
     """Prepare IAM line images paired with lines.txt transcriptions."""
     all_images = _all_data_images(data_dir, output_dir)
@@ -636,6 +689,7 @@ def _prepare_line_dataset(
     if not records:
         raise ValueError("No valid IAM line images matched lines.txt")
     records = _filter_metadata_records(records, split, content_type)
+    records = _filter_pixel_records(records, output_dir, min_pixels)
     if limit is not None:
         if limit > len(records):
             raise ValueError(f"Requested {limit} samples, but only {len(records)} are available")
@@ -699,6 +753,7 @@ def _prepare_word_dataset(
     preprocess: str,
     split: str | None,
     content_type: str | None,
+    min_pixels: int = 0,
 ) -> list[dict[str, Any]]:
     """Prepare pasted IAM word images when no form/XML layout is present."""
     all_images = _all_data_images(data_dir, output_dir)
@@ -778,6 +833,7 @@ def _prepare_word_dataset(
         )
 
     records = _filter_metadata_records(records, split, content_type)
+    records = _filter_pixel_records(records, output_dir, min_pixels)
     if limit is not None:
         if limit > len(records):
             raise ValueError(f"Requested {limit} samples, but only {len(records)} are available")
@@ -1517,6 +1573,7 @@ def prepare_dataset(
     preprocess: str = "original",
     split: str | None = None,
     content_type: str | None = None,
+    min_pixels: int = 0,
 ) -> list[dict[str, Any]]:
     """Validate and prepare generic paired or IAM handwriting data.
 
@@ -1528,6 +1585,8 @@ def prepare_dataset(
     """
     data_dir = Path(data_dir).expanduser().resolve()
     output_dir = Path(output_dir).expanduser().resolve()
+    if isinstance(min_pixels, bool) or not isinstance(min_pixels, int) or min_pixels < 0:
+        raise ValueError("min_pixels must be a nonnegative integer")
     if limit is not None and limit <= 0:
         raise ValueError("limit must be a positive integer when provided")
     if preprocess not in {"original", "enhanced"}:
@@ -1554,11 +1613,11 @@ def prepare_dataset(
             selected_layout = _detect_annotation_layout(data_dir, form_images, output_dir)
     if selected_layout == "paired":
         return _prepare_paired_dataset(
-            data_dir, output_dir, limit, seed, preprocess, split, content_type
+            data_dir, output_dir, limit, seed, preprocess, split, content_type, min_pixels
         )
     if selected_layout == "iam-lines":
         return _prepare_line_dataset(
-            data_dir, output_dir, limit, seed, preprocess, split, content_type
+            data_dir, output_dir, limit, seed, preprocess, split, content_type, min_pixels
         )
     if selected_layout == "iam-words":
         return _prepare_word_dataset(
@@ -1570,6 +1629,7 @@ def prepare_dataset(
             preprocess,
             split,
             content_type,
+            min_pixels,
         )
     # IAM forms retain a useful missing-XML diagnostic when images/ was supplied.
     if reference_dir.exists() and not reference_dir.is_dir():
@@ -1641,6 +1701,7 @@ def prepare_dataset(
         )
 
     prepared = _filter_metadata_records(prepared, split, content_type)
+    prepared = _filter_pixel_records(prepared, output_dir, min_pixels)
     all_prepared = prepared
     if limit is not None:
         if limit > len(prepared):

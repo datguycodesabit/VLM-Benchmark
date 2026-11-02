@@ -152,6 +152,10 @@ def _validate_prepare_options(options: dict[str, Any]) -> None:
     if isinstance(seed, bool) or not isinstance(seed, int) or not 0 <= seed <= _MAX_SEED:
         raise ValueError(f"seed must be an integer from 0 to {_MAX_SEED}")
 
+    min_pixels = options.get("min_pixels", 0)
+    if isinstance(min_pixels, bool) or not isinstance(min_pixels, int) or min_pixels < 0:
+        raise ValueError("min_pixels must be a nonnegative integer")
+
     limit = options.get("limit")
     if limit is not None and (isinstance(limit, bool) or not isinstance(limit, int) or limit <= 0):
         raise ValueError("limit must be a positive integer when provided")
@@ -307,6 +311,14 @@ def freeze(
                 "write_references": prepare_options.get("write_references", False),
             },
         }
+        if prepare_options.get("min_pixels", 0):
+            audit_path = staging / "image-size-filter.json"
+            audit = json.loads(audit_path.read_text(encoding="utf-8"))
+            manifest["provenance"]["selection"]["min_pixels"] = audit["min_pixels"]
+            manifest["provenance"]["image_size_filter"] = {
+                key: value for key, value in audit.items() if key != "excluded"
+            }
+            manifest["provenance"]["image_size_filter"]["audit_sha256"] = _sha256_file(audit_path)
         manifest["benchmark_fingerprint"] = fingerprint(samples, preprocess)
         manifest["integrity"] = _manifest_integrity(manifest)
         v1_path.write_text(
@@ -430,6 +442,16 @@ def _load_validated(
     stored_integrity = raw_manifest.get("integrity")
     if not _is_sha256(stored_integrity) or _manifest_integrity(raw_manifest) != stored_integrity:
         raise ValueError("Snapshot manifest integrity check failed")
+    size_filter = raw_manifest.get("provenance", {}).get("image_size_filter")
+    if size_filter is not None:
+        audit_path = root / "image-size-filter.json"
+        try:
+            audit_path.resolve(strict=True).relative_to(root)
+            valid_audit = _sha256_file(audit_path) == size_filter.get("audit_sha256")
+        except (OSError, ValueError):
+            valid_audit = False
+        if not valid_audit:
+            raise ValueError("Snapshot image-size exclusion audit is missing or modified")
     expected_fingerprint = raw_manifest.get("benchmark_fingerprint")
     computed_fingerprint = fingerprint(disk_samples, raw_manifest["preprocess"])
     if not _is_sha256(expected_fingerprint) or expected_fingerprint != computed_fingerprint:

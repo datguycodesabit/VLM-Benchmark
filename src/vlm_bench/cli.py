@@ -41,6 +41,12 @@ def parser():
     prepare.add_argument("--output", type=Path, help="Default: DATA/prepared")
     prepare.add_argument("--limit", type=int, help="Prepare a reproducible subset")
     prepare.add_argument("--seed", type=int, default=42)
+    prepare.add_argument(
+        "--min-pixels",
+        type=_nonnegative_int_argument,
+        default=0,
+        help="Minimum native crop area (width × height), before preprocessing and sampling; report exclusions",
+    )
     for command in (prepare,):
         _dataset_options(command)
     models = sub.add_parser("models", help="List available models for the selected provider")
@@ -610,6 +616,13 @@ def _json_cli(arguments):
                 payload["result"] = json.loads(suite_report.read_text(encoding="utf-8"))
     elif args.command == "prepare":
         payload["output_directory"] = str((args.output or args.data / "prepared").resolve())
+        if exit_code == 0 and args.min_pixels:
+            audit_path = Path(payload["output_directory"]) / "image-size-filter.json"
+            audit = json.loads(audit_path.read_text(encoding="utf-8"))
+            payload["image_size_filter"] = {
+                key: value for key, value in audit.items() if key != "excluded"
+            }
+            payload["exclusion_audit"] = str(audit_path)
     elif args.command == "compare":
         payload["comparison_directory"] = str(args.output.resolve())
         comparison_files = [
@@ -734,6 +747,7 @@ def main(argv=None):
                 limit=args.limit,
                 seed=args.seed,
                 write_references=True,
+                min_pixels=args.min_pixels,
                 layout=args.layout or "auto",
                 preprocess=args.preprocess or "original",
                 split=args.split,
@@ -741,6 +755,13 @@ def main(argv=None):
             )
             print(f"Prepared {len(snapshot['samples'])} samples in {output.resolve()}")
             print(f"Benchmark: {snapshot['benchmark_fingerprint']}")
+            if args.min_pixels:
+                audit = snapshot["provenance"]["image_size_filter"]
+                print(
+                    f"Image size filter: {audit['excluded_count']} excluded; "
+                    f"{audit['eligible_count']} eligible before subset selection"
+                )
+                print(f"Exclusion audit: {output.resolve() / 'image-size-filter.json'}")
             print("Review the references and saved crops before benchmarking.")
         elif args.command == "auth":
             from . import auth

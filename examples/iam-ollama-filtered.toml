@@ -1,0 +1,14 @@
+# Exploratory cutoff calibrated on the November 1 IAM run. Validate on fresh data.
+# Prepare first using the instructions in docs/CLI_GUIDE.md.
+version = 3
+
+[experiment]
+prepared = "../data/iam-min10000-seed43"
+models = ["ollama:qwen2.5vl:3b"]
+warmup = true
+strict_research = false
+
+[models."ollama:qwen2.5vl:3b"]
+num_predict = 32
+temperature = 0
+seed = 42

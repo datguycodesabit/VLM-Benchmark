@@ -154,3 +154,35 @@ CSV exports now include diagnostic tables alongside `leaderboards.csv`. Reports
 can be regenerated from a saved `comparison.json` or `evaluation.json` without the
 original inference directory. Such regeneration preserves the existing evaluation;
 changing its policy requires the original raw artifacts.
+# IAM word image-size filtering
+
+`prepare --min-pixels N` excludes crops with native width × height below N,
+before enhancement and random subset selection. The default is zero (no filter).
+Excluded samples are listed with dimensions and reasons in
+`PREPARED/image-size-filter.json`. The snapshot records the threshold, population
+counts and audit hash; changing or removing the audit invalidates that snapshot.
+The requested `--limit` is drawn from eligible samples, not the full population.
+
+For an exploratory Ollama word test with a 32-token output cap:
+
+```bash
+uv run vlm-bench prepare --data data/words --layout iam-words \
+  --min-pixels 10000 --limit 100 --seed 43 --output data/iam-min10000-seed43
+uv run vlm-bench run --config examples/iam-ollama-filtered.toml \
+  --repeats 1 --output runs/iam-filtered-test
+```
+
+This cutoff was calibrated using one 100-image run: at least 10,000 native
+pixels retained 49 images with 26 exact matches (53.1%), versus 31/100 overall.
+Higher cutoffs were not consistently better. Area is confounded by word length,
+punctuation and handwriting difficulty; this is not a universal minimum or an
+accuracy gain on the original benchmark. Validate on fresh samples and retain
+the unfiltered baseline. A token cap contains runaway text but can truncate
+answers; keep truncation flags visible. The cap is specific to word experiments,
+not a new global default for lines, pages or equations.
+
+Reproduce the exploratory threshold table without inference:
+
+```bash
+uv run python scripts/analyze_image_sizes.py --run RUN --output runs/size-analysis
+```
