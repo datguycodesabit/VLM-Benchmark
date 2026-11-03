@@ -1,0 +1,20 @@
+# Shared exploratory Aachen line subset: 100 lines, seed 42, original images.
+version = 3
+
+[experiment]
+prepared = "../data/iam-official/aachen/prepared-100-seed42"
+models = ["trocr:microsoft/trocr-large-handwritten", "ollama:qwen2.5vl:3b"]
+warmup = true
+strict_research = false
+
+[models."trocr:microsoft/trocr-large-handwritten"]
+revision = "e68501f437cd2587ae5d68ee457964cac824ddee"
+device = "auto"
+num_predict = 256
+num_beams = 1
+image_resample = "bicubic"
+
+[models."ollama:qwen2.5vl:3b"]
+num_predict = 256
+temperature = 0
+seed = 42

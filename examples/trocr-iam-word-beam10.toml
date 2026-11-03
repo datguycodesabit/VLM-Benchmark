@@ -1,0 +1,14 @@
+# Controlled decoder ablation on our existing words, NOT the paper's IAM line test.
+version = 3
+
+[experiment]
+prepared = "../data/qwen-diagnostic-study/filtered-original"
+models = ["trocr:microsoft/trocr-large-handwritten"]
+warmup = true
+strict_research = false
+
+[models."trocr:microsoft/trocr-large-handwritten"]
+revision = "e68501f437cd2587ae5d68ee457964cac824ddee"
+device = "auto"
+num_predict = 32
+num_beams = 10

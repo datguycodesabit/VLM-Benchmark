@@ -1629,3 +1629,15 @@ def test_parallel_latency_excludes_main_thread_scoring_delay(paired, tmp_path, m
     assert len(rows) == 3
     assert score_calls["count"] == 3
     assert max(row["inference_latency_seconds"] for row in rows) < 0.15
+
+
+def test_trocr_resampling_is_recorded_in_effective_controls():
+    from vlm_bench.engine import _controls
+
+    options = {"num_predict": 256}
+    info = {"device": "cpu", "revision": "pinned"}
+    bicubic = _controls("trocr", options, {"image_resample": "bicubic"}, info)
+    checkpoint = _controls("trocr", options, {}, info)
+    assert bicubic["effective"]["image_resample"] == "bicubic"
+    assert checkpoint["effective"]["image_resample"] == "checkpoint"
+    assert "image_resample" not in bicubic["unsupported"]

@@ -472,7 +472,7 @@ def _controls(provider, options, settings, info):
     requested = dict(options, **settings)
     supported = {
         "ollama": {"num_predict", "temperature", "seed", "streaming", "collect_resources"},
-        "trocr": {"num_predict", "num_beams", "device", "revision"},
+        "trocr": {"num_predict", "num_beams", "device", "revision", "image_resample"},
         "openai": {"num_predict", "image_detail", "reasoning_effort"},
         "chatgpt": {"image_detail", "reasoning_effort"},
         "python": set(requested),
@@ -483,6 +483,7 @@ def _controls(provider, options, settings, info):
             device=info.get("device"),
             revision=info.get("revision"),
             num_beams=settings.get("num_beams", 1),
+            image_resample=settings.get("image_resample", "checkpoint"),
         )
         effective["num_predict"] = min(effective["num_predict"], 4096)
         effective.update(do_sample=False, processor_use_fast=False)

@@ -92,6 +92,10 @@ to review are reported. Resolve blocking issues and inspect review findings
 before freezing evaluation samples. Split by source document by default; use
 the writer-disjoint protocol when writers must be held out.
 
+For complete IAM line tests, see the [official IAM test setup](docs/IAM_OFFICIAL_TESTS.md).
+It provides separate pinned Aachen (2,915 lines) and IAM writer-independent
+(1,861 lines) configurations with ten-beam TrOCR decoding and bicubic resizing.
+
 ## Run a comparison
 
 Freeze the reviewed test set once, then use the resulting portable snapshot for

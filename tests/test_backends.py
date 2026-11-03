@@ -601,7 +601,10 @@ class FakeTensor:
         return self
 
 
-def test_trocr_uses_local_checkpoint_hash_and_reports_load_duration(tmp_path, monkeypatch):
+@pytest.mark.parametrize("image_resample", ["checkpoint", "bicubic"])
+def test_trocr_uses_local_checkpoint_hash_and_reports_load_duration(
+    tmp_path, monkeypatch, image_resample
+):
     checkpoint = tmp_path / "model"
     checkpoint.mkdir()
     (checkpoint / "weights.bin").write_bytes(b"local weights")
@@ -630,8 +633,9 @@ def test_trocr_uses_local_checkpoint_hash_and_reports_load_duration(tmp_path, mo
             captured["processor_use_fast"] = use_fast
             return cls()
 
-        def __call__(self, images, return_tensors):
+        def __call__(self, images, return_tensors, **kwargs):
             assert return_tensors == "pt"
+            captured["processor_options"] = kwargs
             return SimpleNamespace(pixel_values=FakeTensor())
 
         def batch_decode(self, generated, skip_special_tokens):
@@ -665,13 +669,19 @@ def test_trocr_uses_local_checkpoint_hash_and_reports_load_duration(tmp_path, mo
     )
     image = tmp_path / "sample.png"
     Image.new("RGB", (60, 20), "white").save(image)
-    backend = TrOCRBackend(timeout=10, settings={"num_beams": 3})
+    backend = TrOCRBackend(timeout=10, settings={"num_beams": 3, "image_resample": image_resample})
     identity = backend.validate_model(str(checkpoint))
     backend.load(str(checkpoint))
     result = backend.transcribe(str(checkpoint), image, "ignored prompt", {"num_predict": 20})
     assert identity["checkpoint_sha256"]
     assert identity["device"] == "cpu"
     assert captured["generation"]["num_beams"] == 3
+    assert captured["processor_options"] == (
+        {"resample": Image.Resampling.BICUBIC, "size": {"height": 384, "width": 384}}
+        if image_resample == "bicubic"
+        else {}
+    )
+    assert result["provider_details"]["image_resample"] == image_resample
     assert captured["processor_use_fast"] is False
     assert result["message"]["content"] == "written words"
     assert result["provider_details"]["revision"] == "resolved-commit"

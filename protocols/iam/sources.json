@@ -1,0 +1,14 @@
+{
+  "aachen_source": "https://github.com/jpuigcerver/Laia/tree/1a4afa40f08f91f33d0d47a1d89b106091ad076a/egs/iam/data/part/lines/aachen",
+  "official_source": "https://zenodo.org/records/19003721",
+  "official_split_archive_md5": "4803883ed7f52be3c9fa759f538baa94",
+  "files": {
+    "aachen/test.txt": "ffa3f8550e9311fdee2ac62fed1604c42aabbdc9be43aaa764b7c075d33d1324",
+    "aachen/train.txt": "bc716bd796932d0c949fe86fb39465e323ce7e537904681b1f562011b16f0467",
+    "aachen/validation.txt": "7b00ae313f5e885ef7635197125f69b88e31358ee862eb1f5eef77b62021f565",
+    "official/test.txt": "244f3724c5a93fa6c7ec67ddeed7e433fcbbacdd88e87df2e3433e4ec05f7e5e",
+    "official/train.txt": "0d88d51c9ad20936e85679f1ced0ba9eed0d645b964886d2ecad07da269c1c6d",
+    "official/validation1.txt": "1f10294801280d11a16de4eb1551df6d8eb39a3371d489f57c4b54b83be39823",
+    "official/validation2.txt": "1f4ef439c915e0024f0fa94df0e1dc4b38c7af4b3c102204997543b6a266d778"
+  }
+}

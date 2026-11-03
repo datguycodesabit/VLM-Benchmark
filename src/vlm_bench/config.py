@@ -47,6 +47,7 @@ _MODEL_SETTINGS = {
     "revision",
     "num_predict",
     "num_beams",
+    "image_resample",
     "temperature",
     "seed",
     "reasoning_effort",
@@ -124,6 +125,11 @@ def _validate_model_settings(settings: Any, context: str) -> dict[str, Any]:
         raise ValueError(f"Unsupported settings for {context}; credentials must not be in TOML")
 
     result = dict(settings)
+    if "image_resample" in result and (
+        not isinstance(result["image_resample"], str)
+        or result["image_resample"] not in {"checkpoint", "bicubic"}
+    ):
+        raise ValueError(f"image_resample for {context} must be checkpoint or bicubic")
     if "collect_resources" in result and not isinstance(result["collect_resources"], bool):
         raise ValueError(f"collect_resources for {context} must be a boolean")
     if "streaming" in result and not isinstance(result["streaming"], bool):
@@ -235,6 +241,8 @@ def validate_settings(
         if inapplicable:
             names = ", ".join(sorted(inapplicable))
             raise ValueError(f"Settings {names} are not supported for provider {provider!r}")
+        if "image_resample" in canonical_options and provider != "trocr":
+            raise ValueError("image_resample is only supported for provider 'trocr'")
         configured[canonical] = canonical_options
 
     return {

@@ -1,0 +1,37 @@
+# 300 fresh Aachen lines, shared by every condition; ONE pass each (900 predictions).
+version = 3
+
+[experiment]
+prepared = "../data/iam-official/aachen/prepared-fresh300-seed43"
+warmup = true
+strict_research = false
+
+[models."trocr:microsoft/trocr-large-handwritten"]
+revision = "e68501f437cd2587ae5d68ee457964cac824ddee"
+device = "auto"
+num_predict = 256
+image_resample = "bicubic"
+
+[models."ollama:qwen2.5vl:3b"]
+num_predict = 256
+temperature = 0
+seed = 42
+
+[suite]
+repeats = 1
+
+[[suite.conditions]]
+name = "trocr-greedy"
+models = ["trocr:microsoft/trocr-large-handwritten"]
+[suite.conditions.settings."trocr:microsoft/trocr-large-handwritten"]
+num_beams = 1
+
+[[suite.conditions]]
+name = "trocr-beam10"
+models = ["trocr:microsoft/trocr-large-handwritten"]
+[suite.conditions.settings."trocr:microsoft/trocr-large-handwritten"]
+num_beams = 10
+
+[[suite.conditions]]
+name = "qwen-vl-3b"
+models = ["ollama:qwen2.5vl:3b"]

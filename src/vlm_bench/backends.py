@@ -602,7 +602,18 @@ class TrOCRBackend(Backend):
                 rgb_image = image.convert("RGB")
                 try:
                     rgb_image.load()
-                    pixels = processor(images=rgb_image, return_tensors="pt").pixel_values
+                    resample = self.settings.get("image_resample", "checkpoint")
+                    if resample not in {"checkpoint", "bicubic"}:
+                        raise ValueError("TrOCR image_resample must be checkpoint or bicubic")
+                    processor_options = {}
+                    if resample == "bicubic":
+                        processor_options = {
+                            "resample": Image.Resampling.BICUBIC,
+                            "size": {"height": 384, "width": 384},
+                        }
+                    pixels = processor(
+                        images=rgb_image, return_tensors="pt", **processor_options
+                    ).pixel_values
                 finally:
                     rgb_image.close()
             device = resolution.torch_device
@@ -733,6 +744,7 @@ class TrOCRBackend(Backend):
                     "timing_observations": timings,
                     "memory": memory_diagnostics(resolution, torch_module=torch),
                     "num_beams": num_beams,
+                    "image_resample": resample,
                     "processor_use_fast": False,
                     "prompt_supported": False,
                     "tokenization": {
@@ -759,7 +771,8 @@ class TrOCRBackend(Backend):
                     "unsupported_options": sorted(
                         key
                         for key in options
-                        if key not in {"num_predict", "num_beams", "device", "revision"}
+                        if key
+                        not in {"num_predict", "num_beams", "device", "revision", "image_resample"}
                         and not key.startswith("_vlm_bench_")
                     ),
                 },

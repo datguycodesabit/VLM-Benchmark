@@ -426,3 +426,14 @@ def test_config_accepts_research_options(tmp_path):
     assert config["experiment"]["strict_research"] is True
     assert config["experiment"]["protocol"] == "writer-disjoint"
     assert config["experiment"]["formula_rendering"] is True
+
+
+@pytest.mark.parametrize("value", ["bilinear", [], None, 3])
+def test_invalid_trocr_resampling_is_rejected(value):
+    with pytest.raises(ValueError, match="image_resample"):
+        validate_settings(["trocr:test"], {"trocr:test": {"image_resample": value}})
+
+
+def test_resampling_is_trocr_only():
+    with pytest.raises(ValueError, match="only supported"):
+        validate_settings(["ollama:test"], {"ollama:test": {"image_resample": "bicubic"}})
