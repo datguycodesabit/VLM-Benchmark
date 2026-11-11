@@ -265,3 +265,40 @@ def test_manifest_integrity_and_crop_hash_are_checked(tmp_path):
     image_path.write_bytes(b"changed image content")
     with pytest.raises(ValueError, match="image hash does not match"):
         write_inspection_html(run, tmp_path / "review.html", worst=4)
+
+
+def test_live_inspection_reads_committed_prefix_under_writer_lock_without_repair(tmp_path):
+    from vlm_bench.runner import _lock
+
+    run = _make_run(tmp_path / "run")
+    path = run / "results.jsonl"
+    complete = path.read_bytes()
+    path.write_bytes(complete + b'{"model":"unfinished')
+    original = {name: (run / name).read_bytes() for name in ["manifest.json", "results.jsonl"]}
+    with _lock(run):
+        with pytest.raises(ValueError, match="already being used"):
+            inspect_run(run)
+        output, report = write_inspection_html(run, worst=100, live=True)
+    assert report["live_snapshot"] is True
+    assert report["recorded_result_count"] == len(complete.splitlines())
+    assert "Partial live snapshot" in output.read_text()
+    assert "Regenerate to include newer results" in output.read_text()
+    assert output.name.startswith("inspection-live-")
+    for name, data in original.items():
+        assert (run / name).read_bytes() == data
+    assert not (run / "results.interrupted-tail").exists()
+    # A completed malformed line is corruption, not an in-flight tail to skip.
+    path.write_bytes(complete + b'{"broken"}\n')
+    with pytest.raises(ValueError, match="Invalid completed result record"):
+        inspect_run(run, live=True)
+
+
+def test_live_inspection_handles_empty_prefix_and_cli_creates_new_snapshots(tmp_path, capsys):
+    run = _make_run(tmp_path / "run")
+    (run / "results.jsonl").write_bytes(b'{"uncommitted":true}')
+    assert inspect_run(run, live=True)["recorded_result_count"] == 0
+    args = ["inspect", "--run", str(run), "--live", "--worst", "100"]
+    assert main(args) == 0
+    assert main(args) == 0
+    assert len(list(run.glob("inspection-live-*.html"))) == 2
+    assert "0 /" in capsys.readouterr().out

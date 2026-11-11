@@ -8,12 +8,27 @@ manifests.
 from __future__ import annotations
 
 import math
+import unicodedata
 from dataclasses import asdict, dataclass
 from typing import Any, Mapping
 
 SCORING_POLICY_VERSION = 1
 NORMALIZATION_VERSION = "whitespace-v1"
 EQUATION_NORMALIZATION_VERSION = "unicode-nfc-whitespace-v1"
+CONTENT_NORMALIZATION_VERSION = "unicode-nfc-no-punctuation-or-spacing-v1"
+
+
+def normalize_prose(text: str, normalization: str) -> str:
+    """Normalize scoring text only; preserve capitalization, digits, and symbols."""
+    if normalization == NORMALIZATION_VERSION:
+        return " ".join(text.split())
+    if normalization != CONTENT_NORMALIZATION_VERSION:
+        raise ValueError(f"unsupported normalization: {normalization!r}")
+    return "".join(
+        c
+        for c in unicodedata.normalize("NFC", text)
+        if not c.isspace() and not unicodedata.category(c).startswith("P")
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -28,6 +43,7 @@ class ScoringPolicy:
     pass_aggregation: str = "arithmetic_mean"
     normalization: str = NORMALIZATION_VERSION
     equation_normalization: str = EQUATION_NORMALIZATION_VERSION
+    sample_review: dict[str, Any] | None = None
 
     def __post_init__(self) -> None:
         if isinstance(self.version, bool) or not isinstance(self.version, int):
@@ -63,7 +79,7 @@ class ScoringPolicy:
             )
         if self.pass_aggregation != "arithmetic_mean":
             raise ValueError("pass_aggregation must be 'arithmetic_mean'")
-        if self.normalization != NORMALIZATION_VERSION:
+        if self.normalization not in {NORMALIZATION_VERSION, CONTENT_NORMALIZATION_VERSION}:
             raise ValueError(f"unsupported normalization version: {self.normalization!r}")
         if self.equation_normalization != EQUATION_NORMALIZATION_VERSION:
             raise ValueError(
@@ -74,10 +90,17 @@ class ScoringPolicy:
         object.__setattr__(self, "character_accuracy_weight", character_weight)
         object.__setattr__(self, "exact_match_weight", exact_weight)
         object.__setattr__(self, "accuracy_margin_points", margin)
+        if self.sample_review is not None:
+            from .sample_review import validate_review
+
+            object.__setattr__(self, "sample_review", validate_review(self.sample_review))
 
     def to_dict(self) -> dict[str, Any]:
         """Return a stable JSON-compatible representation for run manifests."""
-        return asdict(self)
+        result = asdict(self)
+        if self.sample_review is None:
+            result.pop("sample_review")  # Preserve historical default manifest identities.
+        return result
 
     @classmethod
     def from_dict(cls, value: Mapping[str, Any] | None) -> ScoringPolicy:
@@ -120,6 +143,7 @@ class ScoringPolicy:
                 "equation_normalization",
                 "equation_normalization_version",
             ),
+            "sample_review": ("sample_review",),
         }
         accepted = {name for names in aliases.values() for name in names}
         unknown = set(value) - accepted

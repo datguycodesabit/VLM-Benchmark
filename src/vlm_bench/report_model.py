@@ -29,7 +29,7 @@ from .research import (
     normalize_equation,
     score_equation,
 )
-from .scoring_policy import ScoringPolicy
+from .scoring_policy import CONTENT_NORMALIZATION_VERSION, ScoringPolicy, normalize_prose
 
 REPORT_MODEL_VERSION = 2
 EVALUATION_SCHEMA_VERSION = 2
@@ -58,8 +58,12 @@ def _track_for_sample(sample: Mapping[str, Any]) -> str:
     return "equation" if _sample_kind(sample) == "equation" else "prose"
 
 
-def _normalized_reference(reference: str, track: str) -> str:
-    return normalize_equation(reference) if track == "equation" else normalize_text(reference)
+def _normalized_reference(reference: str, track: str, policy: ScoringPolicy) -> str:
+    return (
+        normalize_equation(reference)
+        if track == "equation"
+        else normalize_prose(reference, policy.normalization)
+    )
 
 
 def _speed_comparable(manifest: Mapping[str, Any]) -> bool:
@@ -176,20 +180,23 @@ def _cell(
     record: Mapping[str, Any] | None,
     sample: Mapping[str, Any],
     track: str,
+    policy: ScoringPolicy,
     *,
     unsupported_is_declared: bool = False,
 ) -> tuple[dict[str, Any], str, str | None]:
     reference = sample.get("reference")
     if not isinstance(reference, str) or not normalize_text(reference):
         raise ValueError(f"eligible sample {sample.get('id')!r} has no non-empty reference")
-    normalized_reference = _normalized_reference(reference, track)
+    normalized_reference = _normalized_reference(reference, track, policy)
+    content_only = track == "prose" and policy.normalization == CONTENT_NORMALIZATION_VERSION
+    reference_word_count = 0 if content_only else len(normalized_reference.split())
     if record is None:
         return (
             {
                 "char_edits": len(normalized_reference),
                 "reference_chars": len(normalized_reference),
-                "word_edits": len(normalized_reference.split()),
-                "reference_words": len(normalized_reference.split()),
+                "word_edits": reference_word_count,
+                "reference_words": reference_word_count,
                 "exact_match": False,
             },
             "missing",
@@ -203,8 +210,11 @@ def _cell(
             metrics = (
                 score_equation(prediction, reference)
                 if track == "equation"
-                else score(prediction, reference)
+                else score(normalize_prose(prediction, policy.normalization), normalized_reference)
             )
+            if content_only:
+                metrics["word_edits"] = metrics["reference_words"] = 0
+                metrics["wer"] = None
         except (TypeError, ValueError):
             metrics = None
         if metrics is not None:
@@ -213,8 +223,8 @@ def _cell(
         {
             "char_edits": len(normalized_reference),
             "reference_chars": len(normalized_reference),
-            "word_edits": len(normalized_reference.split()),
-            "reference_words": len(normalized_reference.split()),
+            "word_edits": reference_word_count,
+            "reference_words": reference_word_count,
             "exact_match": False,
         },
         "failed",
@@ -743,14 +753,23 @@ def evaluate_run(
         isinstance(sample.get("split"), str) and sample["split"].strip()
         for sample in frozen.values()
     )
+    reviewed_exclusions = {}
+    if selected_policy.sample_review is not None:
+        from .sample_review import review_exclusions
+
+        reviewed_exclusions = review_exclusions(
+            selected_policy.sample_review, frozen, manifest_values.get("benchmark_fingerprint")
+        )
     exclusions: list[dict[str, str]] = []
     track_samples: dict[str, dict[str, dict[str, Any]]] = {"prose": {}, "equation": {}}
     for sample_id, sample in frozen.items():
         track = _track_for_sample(sample)
-        reason = _sample_exclusion(sample, split_labels_exist)
+        reason = reviewed_exclusions.get(sample_id) or _sample_exclusion(sample, split_labels_exist)
         reference = sample.get("reference")
-        if not isinstance(reference, str) or not _normalized_reference(reference, track):
+        if not isinstance(reference, str) or not normalize_text(reference):
             reason = reason or "missing_reference"
+        elif not _normalized_reference(reference, track, selected_policy):
+            reason = reason or "empty_reference_after_normalization"
         if reason:
             exclusions.append({"sample_id": sample_id, "track": track, "reason": reason})
         else:
@@ -839,6 +858,7 @@ def evaluate_run(
                     indexed.get((model, pass_index, sample_id)),
                     eligible[sample_id],
                     track,
+                    selected_policy,
                     unsupported_is_declared=sample_id in unsupported_ids,
                 )
                 for pass_index in range(1, planned_passes + 1)
@@ -912,7 +932,9 @@ def evaluate_run(
                 "completed_pass_count": sum(bool(item["terminal_complete"]) for item in per_pass),
                 "terminal_pass_count": sum(bool(item["terminal_complete"]) for item in per_pass),
                 "corpus_cer": statistics.fmean(float(row["corpus_cer"]) for row in per_pass),
-                "wer": statistics.fmean(float(row["wer"]) for row in per_pass),
+                "wer": statistics.fmean(float(row["wer"]) for row in per_pass)
+                if all(row["wer"] is not None for row in per_pass)
+                else None,
                 "exact_match_rate": statistics.fmean(
                     float(row["exact_match_rate"]) for row in per_pass
                 ),
@@ -1020,6 +1042,12 @@ def evaluate_run(
             }
         track_reports[track] = {
             "track": track,
+            "normalization": selected_policy.equation_normalization
+            if track == "equation"
+            else selected_policy.normalization,
+            "wer_unavailable_reason": "word_boundaries_ignored"
+            if track == "prose" and selected_policy.normalization == CONTENT_NORMALIZATION_VERSION
+            else None,
             "eligible_sample_ids": eligible_ids,
             "eligible_sample_count": len(eligible_ids),
             "excluded_samples": [row for row in exclusions if row["track"] == track],
@@ -1073,6 +1101,9 @@ def evaluate_run(
             "scoring_policy_source": policy_source,
             "legacy_scoring_version": manifest_values.get("scoring_version"),
             "benchmark_fingerprint": manifest_values.get("benchmark_fingerprint"),
+            "sample_review_id": _canonical_hash(selected_policy.sample_review)
+            if selected_policy.sample_review is not None
+            else None,
         },
         "planned_passes": planned_passes,
         "run_status": run_status,

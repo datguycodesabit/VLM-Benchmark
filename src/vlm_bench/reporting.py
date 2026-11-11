@@ -92,9 +92,13 @@ def _diagnostic_tables(report):
         "Passes": [],
         "Equivalence": [],
         "Uncertainty": [],
+        "Exclusions": [],
     }
     for condition, evaluation in _evaluations(report):
         for track, data in evaluation.get("tracks", {}).items():
+            tables["Exclusions"].extend(
+                {"condition": condition, **row} for row in data.get("excluded_samples", [])
+            )
             for model in data.get("models", []):
                 common = {"condition": condition, "track": track, "model": model["model"]}
                 tables["Passes"].extend(dict(common, **item) for item in model.get("per_pass", []))
@@ -177,6 +181,22 @@ def _html(report):
         )
         for track, data in evaluation.get("tracks", {}).items():
             parts.append(f"<h3>{_escape(track)} leaderboard</h3>")
+            parts.append(
+                f"<p>Normalization: {_escape(data.get('normalization', 'historical'))}. "
+                f"Eligible samples: {_escape(data.get('eligible_sample_count'))}; "
+                f"excluded: {len(data.get('excluded_samples', []))}.</p>"
+            )
+            if data.get("wer_unavailable_reason") == "word_boundaries_ignored":
+                parts.append(
+                    "<p>WER unavailable: this policy ignores word boundaries. "
+                    "Capitalization, digits, and non-punctuation symbols still count.</p>"
+                )
+            if data.get("excluded_samples"):
+                parts.append(
+                    "<details><summary>Excluded samples and reasons</summary>"
+                    + _table(data["excluded_samples"])
+                    + "</details>"
+                )
             ranking = data.get("ranking", data)
             parts.append(
                 f"<p>Winner: <strong>{_escape(ranking.get('winner'))}</strong>. "
@@ -311,6 +331,10 @@ def _html(report):
     examples = report.get("difficult_examples", [])
     if examples:
         parts.append("<section><h2>Difficult examples</h2>")
+        parts.append(
+            "<p>These diagnostics use original strict scoring and can include reviewed "
+            "exclusions. Their CER is separate from the selected leaderboard policy.</p>"
+        )
         for example in examples:
             parts.append(
                 f"<h3>{_escape(example['model'])} / {_escape(example['sample_id'])}"
@@ -492,6 +516,7 @@ def _evidence(report, source, target):
                 )
             }
             example["edit_counts"] = row["alignment"].get("counts")
+            example["metric_scope"] = "Original strict scoring; may include reviewed exclusions"
             example["pass"] = manifest.get("repetition") or 1
             example["condition"] = manifest.get("suite_condition") or "baseline"
             example["image"] = None

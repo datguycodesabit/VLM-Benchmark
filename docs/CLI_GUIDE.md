@@ -189,3 +189,103 @@ Reproduce the exploratory threshold table without inference:
 ```bash
 uv run python scripts/analyze_image_sizes.py --run RUN --output runs/size-analysis
 ```
+
+## Content scoring and human crop review
+
+Use an explicit scoring policy when punctuation and spacing should not count as
+prose transcription errors. `examples/scoring-content.toml` selects
+`unicode-nfc-no-punctuation-or-spacing-v1`: NFC-normalize text, remove Unicode
+punctuation and all whitespace, and preserve capitalization, digits, and other
+symbols. Thus `living room` and `livingroom` match. This is a content metric;
+it does not measure faithful word boundaries. WER is unavailable under this
+policy, because removing spaces removes those boundaries. Equation scoring
+remains strict: its LaTeX punctuation, superscripts, signs, and braces are not
+removed. Punctuation-only prose references have no scorable content and are
+explicitly listed as `empty_reference_after_normalization` exclusions.
+
+Review crop quality independently of model predictions. Create a portable gallery
+from a frozen dataset:
+
+```bash
+.venv/bin/vlm-bench review \
+  --prepared data/iam-official/aachen/prepared-100-seed42 \
+  --output data/iam-official/aachen/human-review-v1
+```
+
+Open the generated `review.html`, enter your name, and choose `keep` or `exclude`
+for every crop. Exclusions require a reason code and an explanation. Retain hard
+but readable handwriting and ordinary crop seams; exclude severe fragmentation,
+missing content, or invalid image/reference pairs. The page shows images and
+references, with no model predictions. Export the completed `review.json` before
+closing the page; page edits are not automatically saved. The browser downloads
+a new JSON file; use its actual path in the commands below. The initial JSON
+beside the gallery remains a pending template until explicitly replaced.
+Alternatively, edit that template in a text editor: set `reviewer`, an ISO timestamp
+in `reviewed_at`, and each sample's decision. Keep decisions require empty reason
+fields; exclusions require `severe_fragmentation`, `reference_mismatch`,
+`unreadable`, or `other` plus a non-empty explanation.
+
+A declared completed review is not independent certification; record the actual
+reviewer. Agent-generated flags and suggestions must be checked by the person
+completing the review. For a defensible new benchmark, review before comparing
+model outputs. Reviewing after seeing predictions is a post-hoc sensitivity
+analysis and should be reported as such.
+
+Re-score saved predictions without inference, retaining the original artifacts:
+
+```bash
+.venv/bin/vlm-bench report --run runs/YOUR_RUN_OR_EXPERIMENT \
+  --scoring-config examples/scoring-content.toml \
+  --review /absolute/path/to/completed-review.json \
+  --output reports/content-reviewed
+```
+
+`--review` requires `--scoring-config` and a separate `--output`. The completed
+review must cover exactly the frozen sample roster and match its dataset
+fingerprint, crop hashes, and reference hashes. Pending decisions, missing
+reviewer details, stale hashes, unknown IDs, or unexplained exclusions fail
+rather than silently changing eligibility. Reviews never change references,
+delete evidence, or turn a missing/failed prediction into an exclusion. The
+same decisions apply to every model and pass. This offline filter does not skip
+inference on future runs; it controls the scored roster.
+
+Compare models with the same policy and reviewed roster:
+
+```bash
+.venv/bin/vlm-bench compare --runs runs/MODEL_A runs/MODEL_B \
+  --scoring-config examples/scoring-content.toml \
+  --review /absolute/path/to/completed-review.json \
+  --output reports/content-comparison
+```
+
+The embedded review participates in the evaluation identity. Reports include the
+normalization, eligible counts, and exclusions with reasons; CSV and Excel also
+include an Exclusions table. Existing strict reports and raw legacy metrics
+remain available. The difficult-example diagnostic retains its original strict
+metrics and is labeled separately. Never compare a content score against an
+older strict score as if they were the same evaluation. Comparisons still require
+matching snapshots and planned pass counts; unfinished experiments remain
+unfinished after exclusions.
+
+## Inspect results during inference
+
+Open a second terminal and inspect the physical pass directory (the directory
+containing `manifest.json`), without pausing the benchmark:
+
+```bash
+.venv/bin/vlm-bench inspect --run runs/EXPERIMENT/PASS_DIRECTORY --live --worst 100
+```
+
+`--live` reads one snapshot of complete newline-terminated result records, without
+taking the inference lock or repairing/changing source evidence. An incomplete
+last write is left for the running process; malformed completed records still
+raise an error. The generated timestamped HTML includes the images, references,
+predictions, strict CER, and character alignments for saved results. It shows
+recorded versus expected counts and is labeled a partial snapshot, not a final
+benchmark. Unfinished requests are not included. `--worst 100` shows up to 100
+saved results, ordered by error; use the default 20 for a shorter review.
+
+Repeat the command for a newer snapshot. Existing pages do not update themselves.
+Each default live output has a new timestamp; an explicit `--output` must be a
+new filename. These inspection diagnostics use strict scoring; content-policy
+leaderboards remain a separate `report --scoring-config` operation.

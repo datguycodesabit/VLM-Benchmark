@@ -447,8 +447,10 @@ def _validate_scoring(scoring: Any) -> dict[str, Any]:
         raise ValueError("scoring.missing_and_failed_as_empty must be true")
     if result["pass_aggregation"] != "arithmetic_mean":
         raise ValueError("scoring.pass_aggregation must be arithmetic_mean")
-    if result["normalization"] != "whitespace-v1":
-        raise ValueError("scoring.normalization must be whitespace-v1")
+    from .scoring_policy import CONTENT_NORMALIZATION_VERSION, NORMALIZATION_VERSION
+
+    if result["normalization"] not in {NORMALIZATION_VERSION, CONTENT_NORMALIZATION_VERSION}:
+        raise ValueError("scoring.normalization must be a supported prose normalization")
     if result["equation_normalization"] != "unicode-nfc-whitespace-v1":
         raise ValueError("scoring.equation_normalization must be unicode-nfc-whitespace-v1")
     return {
@@ -458,7 +460,7 @@ def _validate_scoring(scoring: Any) -> dict[str, Any]:
         "accuracy_margin_points": margin,
         "missing_and_failed_as_empty": True,
         "pass_aggregation": "arithmetic_mean",
-        "normalization": "whitespace-v1",
+        "normalization": result["normalization"],
         "equation_normalization": "unicode-nfc-whitespace-v1",
     }
 

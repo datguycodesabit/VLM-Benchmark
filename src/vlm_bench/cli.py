@@ -140,6 +140,11 @@ def parser():
     inspect.add_argument("--run", type=Path, required=True)
     inspect.add_argument("--worst", type=_positive_int_argument, default=20)
     inspect.add_argument(
+        "--live",
+        action="store_true",
+        help="Read saved results while inference runs; no lock or modification of evidence",
+    )
+    inspect.add_argument(
         "--output", type=Path, help="HTML output path (default: RUN/inspection.html)"
     )
     report = sub.add_parser(
@@ -168,6 +173,10 @@ def parser():
         choices=["html", "xlsx", "csv", "json"],
         default=["html", "xlsx", "csv", "json"],
     )
+    report.add_argument("--review", type=Path, help="Completed human sample-review JSON")
+    review = sub.add_parser("review", help="Create a blind human crop-review gallery")
+    review.add_argument("--prepared", type=Path, required=True)
+    review.add_argument("--output", type=Path, required=True)
     status = sub.add_parser(
         "status", help="Read progress, coverage, limits, and usage for a saved run"
     )
@@ -234,6 +243,7 @@ def parser():
         type=Path,
         help="Explicit offline re-evaluation using a version 3 scoring configuration",
     )
+    compare.add_argument("--review", type=Path, help="Same completed human review for all sources")
     return root
 
 
@@ -276,16 +286,21 @@ def _positive_float_argument(value):
     return result
 
 
-def _offline_policy(config_path, *, default=False):
+def _offline_policy(config_path, *, default=False, review_path=None):
     from .scoring_policy import ScoringPolicy
 
+    if review_path and not config_path:
+        raise ValueError("--review requires --scoring-config to explicitly choose scoring rules")
     if config_path:
         from .config import load_config
 
         config = load_config(config_path)
         if config["version"] != 3:
             raise ValueError("Offline scoring configuration requires version = 3")
-        return ScoringPolicy.from_dict(config["scoring"]).to_dict()
+        policy = dict(config["scoring"])
+        if review_path:
+            policy["sample_review"] = json.loads(Path(review_path).read_text(encoding="utf-8"))
+        return ScoringPolicy.from_dict(policy).to_dict()
     return ScoringPolicy().to_dict() if default else None
 
 
@@ -308,6 +323,11 @@ def _print_weighted_model(report):
             ranking = data["ranking"]
             winner = ranking.get("winner") or f"withheld ({ranking.get('winner_reason')})"
             print(f"{condition} / {track}: winner {winner}")
+            print(
+                f"Normalization: {data.get('normalization', 'historical')}; "
+                f"{data['eligible_sample_count']} eligible, "
+                f"{len(data.get('excluded_samples', []))} excluded"
+            )
             print(f"{'Rank':>4} {'Model':<44} {'Score':>9} {'SD':>8} {'p50 sec':>10} Coverage")
             rows = sorted(
                 data.get("models", []),
@@ -674,7 +694,10 @@ def _json_cli(arguments):
             from .reporting import load_report_model
 
             payload["result"] = load_report_model(
-                args.run, policy=_offline_policy(args.scoring_config, default=args.weighted)
+                args.run,
+                policy=_offline_policy(
+                    args.scoring_config, default=args.weighted, review_path=args.review
+                ),
             )
     elif args.command == "status":
         payload["run_directory"] = str(args.run.resolve())
@@ -696,6 +719,7 @@ def _command_hint(arguments):
         "resume",
         "inspect",
         "report",
+        "review",
         "status",
         "auth",
         "doctor",
@@ -1177,7 +1201,14 @@ def main(argv=None):
         elif args.command == "inspect":
             from .inspection import write_inspection_html
 
-            output, report = write_inspection_html(args.run, args.output, worst=args.worst)
+            output, report = write_inspection_html(
+                args.run, args.output, worst=args.worst, live=args.live
+            )
+            if args.live:
+                print(
+                    f"Partial live snapshot: {report['recorded_result_count']} / "
+                    f"{report['expected_result_count']} results saved; no final ranking."
+                )
             print(
                 f"{report['selected_count']} model/sample results selected from "
                 f"{report['eligible_result_count']} eligible results across "
@@ -1199,9 +1230,18 @@ def main(argv=None):
                     f"{row['status']:<12} {cer:>8} {edits:>11} {flags}"
                 )
             print(f"Saved inspection report: {output}")
+        elif args.command == "review":
+            from .sample_review import create_review
+
+            page = create_review(args.prepared, args.output)
+            print(f"Saved: {page}")
+            print(f"Saved: {page.parent / 'review.json'}")
+            print("Review each crop, enter your name, and export the completed decisions.")
         elif args.command == "report":
+            if args.review and not args.output:
+                raise ValueError("--review requires --output for a separate derived report")
             if args.group_by:
-                if args.weighted or args.scoring_config or args.output:
+                if args.weighted or args.scoring_config or args.output or args.review:
                     raise ValueError(
                         "--group-by cannot be combined with weighted policy or report output options"
                     )
@@ -1216,21 +1256,33 @@ def main(argv=None):
                     args.run,
                     args.output,
                     formats=args.formats,
-                    policy=_offline_policy(args.scoring_config, default=args.weighted),
+                    policy=_offline_policy(
+                        args.scoring_config, default=args.weighted, review_path=args.review
+                    ),
                 ):
                     print(f"Saved: {output}")
                 _print_weighted(
-                    args.run, policy=_offline_policy(args.scoring_config, default=args.weighted)
+                    args.run,
+                    policy=_offline_policy(
+                        args.scoring_config, default=args.weighted, review_path=args.review
+                    ),
                 )
         elif args.command == "compare":
             from .comparison import compare
             from .weighted_comparison import compare_weighted, needs_weighted_comparison
 
-            if args.weighted or args.scoring_config or needs_weighted_comparison(args.runs):
+            if (
+                args.weighted
+                or args.scoring_config
+                or args.review
+                or needs_weighted_comparison(args.runs)
+            ):
                 report = compare_weighted(
                     args.runs,
                     args.output,
-                    policy=_offline_policy(args.scoring_config, default=args.weighted),
+                    policy=_offline_policy(
+                        args.scoring_config, default=args.weighted, review_path=args.review
+                    ),
                 )
                 _print_weighted_model(report)
                 for name in (

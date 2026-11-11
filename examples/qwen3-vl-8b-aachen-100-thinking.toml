@@ -1,0 +1,14 @@
+# Thinking variant: allow room for reasoning before the final transcription.
+# Uses the same frozen 100-line Aachen subset and OCR prompt as earlier runs.
+version = 3
+
+[experiment]
+prepared = "../data/iam-official/aachen/prepared-100-seed42"
+models = ["ollama:qwen3-vl:8b"]
+warmup = true
+strict_research = false
+
+[models."ollama:qwen3-vl:8b"]
+num_predict = 4096
+temperature = 0
+seed = 42

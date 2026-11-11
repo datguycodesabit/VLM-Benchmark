@@ -1,0 +1,13 @@
+# Direct-transcription variant, with the earlier 256-token OCR budget.
+version = 3
+
+[experiment]
+prepared = "../data/iam-official/aachen/prepared-100-seed42"
+models = ["ollama:qwen3-vl:8b-instruct"]
+warmup = true
+strict_research = false
+
+[models."ollama:qwen3-vl:8b-instruct"]
+num_predict = 256
+temperature = 0
+seed = 42

@@ -9,6 +9,8 @@ import math
 import os
 import re
 from collections import Counter, defaultdict
+from contextlib import nullcontext
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -67,17 +69,38 @@ def _finite_nonnegative(value: Any) -> float | None:
     return number if math.isfinite(number) and number >= 0 else None
 
 
-def _load_run(run_dir: str | os.PathLike[str]):
+def _read_live_records(path: Path) -> list[dict[str, Any]]:
+    """Read a single committed JSONL prefix without locking or repairing the writer's file."""
+    if not path.exists():
+        return []
+    data = path.read_bytes()
+    end = data.rfind(b"\n")
+    if end < 0:
+        return []
+    rows = []
+    for index, line in enumerate(data[: end + 1].splitlines(), start=1):
+        try:
+            rows.append(json.loads(line))
+        except (ValueError, UnicodeDecodeError) as exc:
+            raise ValueError(f"Invalid completed result record at line {index}: {path}") from exc
+    return rows
+
+
+def _load_run(run_dir: str | os.PathLike[str], *, live: bool = False):
     directory = Path(run_dir).expanduser().resolve()
     if not directory.is_dir():
         raise ValueError(f"Run directory does not exist: {directory}")
     manifest_path = directory / "manifest.json"
     if not manifest_path.is_file():
         raise ValueError(f"Run manifest is missing: {manifest_path}")
-    with _lock(directory):
+    with nullcontext() if live else _lock(directory):
         try:
             manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-            records = read_records(directory / "results.jsonl")
+            records = (
+                _read_live_records(directory / "results.jsonl")
+                if live
+                else read_records(directory / "results.jsonl")
+            )
         except (OSError, ValueError) as exc:
             raise ValueError(f"Could not read saved run data from {directory}: {exc}") from exc
     if not isinstance(manifest, dict):
@@ -314,12 +337,14 @@ def _row_error_rate(
         return stored
 
 
-def inspect_run(run_dir: str | os.PathLike[str], worst: int = 20) -> dict[str, Any]:
+def inspect_run(
+    run_dir: str | os.PathLike[str], worst: int = 20, *, live: bool = False
+) -> dict[str, Any]:
     """Select the worst eligible model/sample results for offline review."""
     if isinstance(worst, bool) or not isinstance(worst, int) or worst <= 0:
         raise ValueError("worst must be a positive integer")
     directory, manifest, samples, records, eligibility, eligible_ids, excluded_ids = _load_run(
-        run_dir
+        run_dir, live=live
     )
     candidates = []
     ignored_unsupported = 0
@@ -383,6 +408,10 @@ def inspect_run(run_dir: str | os.PathLike[str], worst: int = 20) -> dict[str, A
         )
     return {
         "schema_version": 1,
+        "live_snapshot": live,
+        "snapshot_at": datetime.now(timezone.utc).isoformat() if live else None,
+        "recorded_result_count": len(records),
+        "expected_result_count": len(samples) * len(manifest["models"]),
         "run_directory": str(directory),
         "requested_worst_count": worst,
         "selected_count": len(selected),
@@ -457,12 +486,21 @@ def write_inspection_html(
     run_dir: str | os.PathLike[str],
     output_path: str | os.PathLike[str] | None = None,
     worst: int = 20,
+    *,
+    live: bool = False,
 ) -> tuple[Path, dict[str, Any]]:
     """Write a local HTML review and return its path and report data."""
-    report = inspect_run(run_dir, worst=worst)
+    report = inspect_run(run_dir, worst=worst, live=live)
     directory = Path(report["run_directory"])
     output = (
-        Path(output_path).expanduser().resolve() if output_path else directory / "inspection.html"
+        Path(output_path).expanduser().resolve()
+        if output_path
+        else directory
+        / (
+            f"inspection-live-{datetime.now(timezone.utc):%Y%m%dT%H%M%S%fZ}.html"
+            if live
+            else "inspection.html"
+        )
     )
     if os.path.lexists(output):
         raise FileExistsError(f"Inspection output already exists: {output}")
@@ -499,7 +537,16 @@ def write_inspection_html(
         ".substitution{background:#ffe0de}.deletion{background:#fff0c2}.insertion{background:#dff3e4}"
         ".notice{color:#805700}.error{color:#a11}details{margin-top:1rem}"
         "</style></head><body><h1>VLM Bench error inspection</h1>"
-        f"<p>{report['selected_count']} model/sample results selected from "
+        + (
+            f"<p class='notice'><strong>Partial live snapshot</strong> at "
+            f"{html.escape(report['snapshot_at'])}: {report['recorded_result_count']} of "
+            f"{report['expected_result_count']} model/sample results saved. "
+            "Only completed saved results are shown; this is not a final benchmark. "
+            "Regenerate to include newer results. No inference is started.</p>"
+            if live
+            else ""
+        )
+        + f"<p>{report['selected_count']} model/sample results selected from "
         f"{report['eligible_result_count']} eligible results across "
         f"{report['eligible_sample_count']} eligible samples; "
         f"{report['excluded_sample_count']} excluded by research eligibility rules. "

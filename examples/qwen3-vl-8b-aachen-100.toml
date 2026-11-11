@@ -1,0 +1,13 @@
+# Same frozen 100-line Aachen subset as the earlier TrOCR/Qwen comparison.
+version = 3
+
+[experiment]
+prepared = "../data/iam-official/aachen/prepared-100-seed42"
+models = ["ollama:qwen3-vl:8b"]
+warmup = true
+strict_research = false
+
+[models."ollama:qwen3-vl:8b"]
+num_predict = 256
+temperature = 0
+seed = 42

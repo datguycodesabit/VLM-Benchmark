@@ -1,0 +1,7 @@
+# Offline prose content scoring: case-sensitive; equations remain strict.
+version = 3
+
+[scoring]
+normalization = "unicode-nfc-no-punctuation-or-spacing-v1"
+character_accuracy_weight = 0.70
+exact_match_weight = 0.30

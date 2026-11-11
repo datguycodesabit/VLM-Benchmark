@@ -133,6 +133,7 @@ def compare_weighted(sources, output, *, policy=None):
             if all(item.get("finalizable") for item in evaluations_for_condition)
             else "incomplete",
             manifest={
+                "benchmark_fingerprint": next(iter(fingerprints)),
                 "models": merged_models,
                 "model_capabilities": capabilities,
                 "model_info": model_info,
