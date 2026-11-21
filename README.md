@@ -1,4 +1,4 @@
-# VLM Bench
+# VLM Benchmark
 
 **0.2.0:** See the [CLI completion report](docs/COMPLETION_REPORT.md) for the
 finished command workflow, recovery, weighted comparisons and validation.
